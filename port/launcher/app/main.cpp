@@ -69,6 +69,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#elif defined(__APPLE__)
+#include <climits>
+#include <mach-o/dyld.h>     /* _NSGetExecutablePath */
 #endif
 
 #include "RmlUi_Platform_SDL.h"
@@ -104,7 +107,19 @@ const char *const k_url_kofi = "https://ko-fi.com/giz_music";
 /* The list of releases (pre-releases included: the channel picks among them). */
 const char *const k_url_api_releases = "https://api.github.com/repos/GiZcesi/OpenTricky/releases?per_page=10";
 const double k_update_wait_ms = 3000;      /* an answer later than this is not shown (the cache keeps it) */
+#ifdef __APPLE__
+/* macOS: one app, OpenTricky.app. The launcher and the game are in
+ * Contents/MacOS, the interface (ui/) and the licences in Contents/Resources
+ * (SDL_GetBasePath), settings.ini, the logs and the saves in the data folder
+ * of the game (settings_docs_dir: $OPENTRICKY_DATA_DIR, which the app sets
+ * to "SSX Tricky data" beside itself, else ~/Library/Application
+ * Support/OpenTricky). No updater: a new version is a new app. */
+const char *const k_game_exe = "SSX Tricky";
+std::string g_game_dir;     /* the launcher's own folder, with the game: Contents/MacOS/ */
+std::string g_beside;       /* the folder holding OpenTricky.app (or the launcher, outside an app) */
+#else
 const char *const k_game_exe = "SSX Tricky.exe";
+#endif
 
 /* ── Timing and log ──────────────────────────────────────────────── */
 
@@ -1012,7 +1027,11 @@ void wine_roots(std::vector<std::pair<std::string, int>> &roots)
 std::vector<DiscFound> find_discs(bool beside_only)
 {
     double t0 = now_ms();
+#ifdef __APPLE__
+    std::vector<std::pair<std::string, int>> roots = { { g_beside, 1 } };   /* beside OpenTricky.app */
+#else
     std::vector<std::pair<std::string, int>> roots = { { g.base, 1 } };
+#endif
     if (!g.find_root.empty()) roots.push_back({ g.find_root, 1 });    /* tests */
     if (!beside_only) {
         for (SDL_Folder f : { SDL_FOLDER_DOWNLOADS, SDL_FOLDER_DESKTOP, SDL_FOLDER_DOCUMENTS })
@@ -1363,6 +1382,10 @@ void rebuild_rows()
         if (id == S_LAUNCHER_MUSIC || id == S_LAUNCHER_SOUNDS ||
             id == S_THEME ||          /* random at each start, no choice */
             (d->flags & SETTING_PENDING)) continue;
+#ifdef OT_NO_UPDATES
+        /* No updater in this build (macOS): no update settings, no Check now, no Restore. */
+        if (id == S_CHECK_UPDATES || id == S_UPDATE_CHANNEL) continue;
+#endif
         /* CONTROLS: the bindings are the remapping table, not rows. */
         if (id >= S_KEY_FIRST && id < S_PAD_FIRST + SETTINGS_PAD_CONTROLS) continue;
         if (d->group && (!group || strcmp(group, d->group) != 0)) {
@@ -2216,6 +2239,11 @@ void load_documents()
     Rml::Factory::ClearStyleSheetCache();
     Rml::Factory::ClearTemplateCache();
     g.home = g.ctx->LoadDocument(g.prog + "ui/home.rml");
+#ifdef __APPLE__
+    if (g.home)
+        if (Rml::Element *e = g.home->GetElementById("saves_where"))
+            e->SetInnerRML("<span class=\"bl\"></span>Your settings and saves stay in the game's data folder on this Mac");
+#endif
     g.settings = g.ctx->LoadDocument(g.prog + "ui/settings.rml");
     g.dialog = g.ctx->LoadDocument(g.prog + "ui/dialog.rml");
     if (!g.home || !g.settings || !g.dialog) otlog("error: cannot load the interface documents");
@@ -2356,12 +2384,20 @@ bool pad_in_use_is_ps()
 bool play()
 {
     if (!g.have_disc || g.game) return false;
+#ifdef __APPLE__
+    std::string exe = g_game_dir + k_game_exe;
+#else
     std::string exe = g.prog + k_game_exe;
+#endif
     if (!SDL_GetPathInfo(exe.c_str(), nullptr)) {
         otlog("play: %s not found in bin\\ nor beside the launcher", k_game_exe);
         g.notice_kick = "PLAY";
         g.notice_head = "GAME NOT FOUND";
+#ifdef __APPLE__
+        g.notice_text = std::string("\xE2\x80\x9C") + k_game_exe + "\xE2\x80\x9D should be inside OpenTricky.app (Contents/MacOS). Copy the whole app again.";
+#else
         g.notice_text = std::string("\xE2\x80\x9C") + k_game_exe + "\xE2\x80\x9D should be in the bin folder beside OpenTricky.exe. Unzip the whole release into one folder.";
+#endif
         g.notice_file = "";
         g.model.DirtyVariable("notice_kick");
         g.model.DirtyVariable("notice_head");
@@ -2404,6 +2440,17 @@ bool play()
     }
     SDL_Environment *env = SDL_CreateEnvironment(true);
     SDL_SetEnvironmentVariable(env, "OPENTRICKY_LAUNCHER", "1", true);   /* the crash screen is the launcher's */
+#ifdef __APPLE__
+    {
+        /* The game reads settings.ini where the launcher wrote it: its data
+         * folder (settings_docs_dir), the same rule on both sides. The app sets
+         * both variables (macos/OpenTricky.sh); they are inherited, and the data
+         * folder is named here as well when the launcher was started without it. */
+        std::string data = g.base;
+        while (data.size() > 1 && data.back() == '/') data.pop_back();
+        SDL_SetEnvironmentVariable(env, "OPENTRICKY_DATA_DIR", data.c_str(), false);
+    }
+#endif
     /* Button style Auto, PlayStation controllers on (experimental): the
      * game's buttons drawn as the controller in use. The game picks its
      * style once, at start; a variable already set (tests) is kept. */
@@ -2430,8 +2477,13 @@ bool play()
         otlog("play: cannot start the game: %s", SDL_GetError());
         g.notice_kick = "PLAY";
         g.notice_head = "THE GAME COULDN'T START";
+#ifdef __APPLE__
+        g.notice_text = std::string("macOS couldn't start \xE2\x80\x9C") + k_game_exe +
+                        "\xE2\x80\x9D inside OpenTricky.app. Copy the whole app again, or allow it in System Settings > Privacy & Security.";
+#else
         g.notice_text = std::string("Windows couldn't start \xE2\x80\x9C") + k_game_exe +
                         "\xE2\x80\x9D in the bin folder. An antivirus may have blocked it: allow it, or unzip the release again.";
+#endif
         g.notice_file = "";
         show_modal("notice");
         return false;
@@ -2580,10 +2632,27 @@ std::string desktop_dir()
     return g.base;
 }
 
+/* A file:// URL of a local path. Outside Windows the path is absolute
+ * ("/Users/...") and percent-encoded (macOS refuses a URL with a space). */
+std::string file_url(const std::string &path)
+{
+#ifdef _WIN32
+    std::string url = "file:///" + path;
+    for (char &c : url) if (c == '\\') c = '/';
+    return url;
+#else
+    std::string url = "file://";
+    for (unsigned char c : path) {
+        if (isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') url += (char)c;
+        else { char h[4]; snprintf(h, sizeof h, "%%%02X", c); url += h; }
+    }
+    return url;
+#endif
+}
+
 void open_folder(const std::string &dir)
 {
-    std::string url = "file:///" + dir;
-    for (char &c : url) if (c == '\\') c = '/';
+    std::string url = file_url(dir);
     if (!SDL_OpenURL(url.c_str())) otlog("cannot open %s: %s", dir.c_str(), SDL_GetError());
 }
 
@@ -2627,7 +2696,11 @@ void prepare_bug_report()
     char tid[64];
     snprintf(tid, sizeof tid, "%08X", g.disc.title_id);
     info += "Disc image: " + std::string(g.disc_state) + " (title id " + tid + ")\n";
+#ifdef __APPLE__
+    info += "Settings file: the data folder (OPENTRICKY_DATA_DIR, or Application Support)\n\n";
+#else
     info += "Settings file: " + std::string(g.ini_in_docs ? "Documents\\My Games\\SSX Tricky" : "beside the launcher") + "\n\n";
+#endif
     info += "Launcher messages (last lines):\n";
     for (const std::string &l : g_log_ring) info += l + "\n";
     z.push_back({ "launcher.txt", ot_scrub(info, fold) });
@@ -2720,8 +2793,7 @@ void dialog_action(const std::string &a)
     if (a == "logs") { open_folder(ini_dir()); return; }
     if (a == "licences") {
         std::string f = g.prog + "THIRD-PARTY-LICENSES.txt";
-        std::string url = "file:///" + f;
-        for (char &c : url) if (c == '\\') c = '/';
+        std::string url = file_url(f);
         if (!SDL_OpenURL(url.c_str())) otlog("cannot open the licences: %s", SDL_GetError());
         return;
     }
@@ -3575,6 +3647,12 @@ void update_row_refresh()
 
 void update_start(bool manual)
 {
+#ifdef OT_NO_UPDATES
+    (void)manual;
+    if (!g.upd_started) otlog("updates: not in this build (a new version is a new app)");
+    g.upd_started = true;
+    return;
+#endif
     if (g_update_job) {                 /* one at a time: a click during the check at start takes it over */
         if (manual && !g_update_job_manual) {
             g_update_job_manual = true;
@@ -3717,6 +3795,10 @@ void install_fail(const std::string &phase, const std::string &head, const std::
 
 void install_start(bool restore)
 {
+#ifdef OT_NO_UPDATES
+    (void)restore;
+    return;
+#endif
     if (g_install || g.game) return;
     OtInstallRequest req;
     req.base = g.base;
@@ -4122,6 +4204,37 @@ int main(int argc, char **argv)
     double t_sdl = now_ms();
     const char *bp = SDL_GetBasePath();
     g.base = bp ? bp : "";
+#ifdef __APPLE__
+    {
+        /* macOS (see k_game_exe): ui/ and the licences from SDL_GetBasePath
+         * (Contents/Resources/ in the app, the launcher's folder outside one);
+         * the game beside the launcher's own binary; the "install root" (the
+         * game's working folder, crash reports, relative paths) is the data
+         * folder, where settings.ini is. No recovery, tidy or cleanup of updates. */
+        g.prog = g.base;
+        char exe[4096], real[PATH_MAX];
+        uint32_t n = sizeof exe;
+        if (_NSGetExecutablePath(exe, &n) == 0 && realpath(exe, real)) g_game_dir = ot_dir_of(real);
+        else g_game_dir = g.base;
+        std::string d = g_game_dir;
+        if (d.size() > 1) d.pop_back();
+        const std::string app_tail = ".app/Contents/MacOS";
+        g_beside = g_game_dir;
+        if (d.size() > app_tail.size() && d.compare(d.size() - app_tail.size(), app_tail.size(), app_tail) == 0) {
+            std::string app = d.substr(0, d.size() - std::string("/Contents/MacOS").size());
+            g_beside = ot_dir_of(app);
+        }
+        char data[1024];
+        if (settings_docs_dir(data, sizeof data)) {
+            SDL_CreateDirectory(data);
+            g.base = data;
+            if (g.base.back() != '/') g.base += '/';
+        }
+        otlog("program folder: %s", g.prog.c_str());
+        otlog("game folder: %s", g_game_dir.c_str());
+        otlog("data folder: %s", g.base.c_str());
+    }
+#else
     {
         /* An update or a Restore cut half-way: put back (or finished) before
          * anything reads the program's files; the player is told at the first frame. */
@@ -4172,6 +4285,7 @@ int main(int argc, char **argv)
         std::string b = g.base;
         std::thread([b]() { ot_install_cleanup(b); }).detach();
     }
+#endif
 
     /* Settings: the registry and settings.ini. */
     g.set = (Settings *)calloc(1, sizeof(Settings));
@@ -4223,7 +4337,14 @@ int main(int argc, char **argv)
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+#ifdef __APPLE__
+    /* macOS: a core context must be forward compatible; window sizes are in
+     * points (the Retina scale is the pixel density, below). */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    float scale = 1;
+#else
     float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+#endif
     if (scale <= 0) scale = 1;
     int ww = (int)(1280 * scale), wh = (int)(800 * scale);
     SDL_Rect usable;
@@ -4242,7 +4363,11 @@ int main(int argc, char **argv)
         SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "0");
         otlog("window: XBOX_NO_ACTIVATE: shown without the focus, behind the other windows");
     }
-    g.window = SDL_CreateWindow("OpenTricky", ww, wh, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
+    SDL_WindowFlags wflags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN;
+#ifdef __APPLE__
+    wflags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;   /* drawn at the Retina pixels (fit_window takes pixels) */
+#endif
+    g.window = SDL_CreateWindow("OpenTricky", ww, wh, wflags);
     if (!g.window) {
         otlog("error: window: %s", SDL_GetError());
         return fatal(no_window, SDL_GetError());

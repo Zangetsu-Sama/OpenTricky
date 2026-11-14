@@ -8,7 +8,7 @@
  * honestly on POSIX so the Xbox-specific HLE code above it is unchanged and
  * stays verifiable.
  *
- * Linux-only: on Windows these come from the real <windows.h>.
+ * Linux/MacOS only: on Windows these come from the real <windows.h>.
  */
 
 #ifndef WIN32_COMPAT_H
@@ -29,6 +29,7 @@ extern "C" {
 #define WAIT_IO_COMPLETION   0x000000C0u
 #define WAIT_TIMEOUT         0x00000102u
 #define WAIT_FAILED          0xFFFFFFFFu
+#define MAXIMUM_WAIT_OBJECTS 64
 #ifndef INFINITE
 #define INFINITE             0xFFFFFFFFu
 #endif
@@ -55,6 +56,8 @@ extern "C" {
 #define MEM_RESERVE    0x00002000u
 #define MEM_DECOMMIT   0x00004000u
 #define MEM_RELEASE    0x00008000u
+#define MEM_FREE       0x00010000u
+#define MEM_PRIVATE    0x00020000u
 #define MEM_TOP_DOWN   0x00100000u
 #define PAGE_NOACCESS          0x01u
 #define PAGE_READONLY          0x02u
@@ -75,6 +78,7 @@ typedef VOID  (WINAPI *WAITORTIMERCALLBACK)(PVOID lpParameter, BOOLEAN TimerOrWa
 typedef void  *LPSECURITY_ATTRIBUTES;
 typedef void  *PTP_CALLBACK_INSTANCE;
 typedef VOID  (WINAPI *PTP_SIMPLE_CALLBACK)(PTP_CALLBACK_INSTANCE Instance, PVOID Context);
+typedef BOOL  (WINAPI *PINIT_ONCE_FN)(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context);
 
 /* ---- Last-error -------------------------------------------------------- */
 DWORD GetLastError(void);
@@ -86,9 +90,8 @@ LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
-static inline LONG64 InterlockedIncrement64(volatile LONG64 *Addend)
-{ return __atomic_add_fetch(Addend, 1, __ATOMIC_SEQ_CST); }
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -97,6 +100,16 @@ VOID EnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID LeaveCriticalSection(LPCRITICAL_SECTION cs);
 BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID DeleteCriticalSection(LPCRITICAL_SECTION cs);
+
+/* ---- Slim reader/writer locks ------------------------------------------ */
+VOID InitializeSRWLock(PSRWLOCK lock);
+VOID AcquireSRWLockShared(PSRWLOCK lock);
+VOID ReleaseSRWLockShared(PSRWLOCK lock);
+VOID AcquireSRWLockExclusive(PSRWLOCK lock);
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock);
+
+/* ---- One-time initialisation ------------------------------------------- */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context);
 
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
@@ -114,6 +127,13 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
+/* A handle on a file (kind 1) or directory (kind 2) inside the mounted disc
+ * image: its byte offset and size in the image, its directory node, and a
+ * per-handle position. w32_handle_iso returns the kind, 0 = a host file. */
+void        w32_handle_set_iso(HANDLE h, int kind, unsigned long long off,
+                               unsigned long long size, int node);
+int         w32_handle_iso(HANDLE h, unsigned long long *off, unsigned long long *size,
+                           int *node, unsigned long long **pos);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -154,7 +174,9 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
+DWORD  GetThreadId(HANDLE h);
 VOID   SwitchToThread(void);
+#define YieldProcessor() sched_yield()
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
 /* ---- Sleep ------------------------------------------------------------ */
@@ -171,6 +193,13 @@ BOOL   DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionE
 BOOL   ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period);
 BOOL   TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
                                    PVOID context, PVOID env);
+
+/* ---- Waitable timers --------------------------------------------------- */
+typedef VOID (*PTIMERAPCROUTINE)(PVOID arg, DWORD lowValue, DWORD highValue);
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
+BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                        PTIMERAPCROUTINE completion, PVOID arg, BOOL resume);
+BOOL   CancelWaitableTimer(HANDLE h);
 
 /* ---- Heap ------------------------------------------------------------- */
 HANDLE GetProcessHeap(void);
@@ -200,12 +229,15 @@ BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);
 VOID  OutputDebugStringA(LPCSTR str);
 VOID  OutputDebugStringW(LPCWSTR str);
 VOID  ExitProcess(UINT exitCode);
+BOOL  IsDebuggerPresent(void);
+VOID  DebugBreak(void);
 BOOL  TerminateProcess(HANDLE process, UINT exitCode);
 VOID  SecureZeroMemory(PVOID ptr, SIZE_T cnt);
 unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 
 /* MSVC stack alloca alias. <alloca.h> provides the underlying function. */
 #include <alloca.h>
+#include <sched.h>
 #define _alloca(n) alloca(n)
 
 /* ---- Win32 file API (POSIX-backed) ----------------------------------- */
@@ -238,6 +270,7 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
 BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped);
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
+BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
 BOOL   FlushFileBuffers(HANDLE h);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
@@ -245,6 +278,9 @@ SHORT GetAsyncKeyState(int vKey);
 HWND  FindWindowA(LPCSTR className, LPCSTR windowName);
 HWND  GetActiveWindow(void);
 BOOL  SetWindowTextA(HWND hwnd, LPCSTR text);
+int   GetWindowTextA(HWND hwnd, LPSTR text, int count);
+typedef BOOL (CALLBACK *WNDENUMPROC)(HWND hwnd, LPARAM lParam);
+BOOL  EnumWindows(WNDENUMPROC enumProc, LPARAM lParam);
 
 /* MessageBox + flags (stderr stub on POSIX). */
 int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
@@ -363,7 +399,9 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_INSUFFICIENT_BUFFER     122u
 #define ERROR_ALREADY_EXISTS          183u
 #define ERROR_MORE_DATA               234u
+#define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u
+#define ERROR_INVALID_ADDRESS         487u
 #define ERROR_IO_PENDING              997u
 #define ERROR_CANCELLED               1223u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
@@ -406,8 +444,19 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
 
 /* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
  * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
- * ucontext_t; for now we accept the registration and never fire. */
+ * ucontext_t; for now we accept the registration and never fire. 
+ * 
+ * Note: GCC needs correct struct. This is from nxdk
+ * */
+#if defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+typedef struct _EXCEPTION_POINTERS
+{
+    PEXCEPTION_RECORD ExceptionRecord;
+    PCONTEXT ContextRecord;
+} EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
+#else
 typedef void *PEXCEPTION_POINTERS;
+#endif
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
@@ -426,6 +475,11 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_FLT_UNDERFLOW          0xC0000093u
 #define EXCEPTION_FLT_INEXACT_RESULT     0xC000008Fu
 #define EXCEPTION_FLT_DENORMAL_OPERAND   0xC000008Du
+
+/* For linux devices*/
+#ifndef EXCEPTION_SINGLE_STEP
+  #define EXCEPTION_SINGLE_STEP 0x80000004u
+#endif
 
 /* ---- Memory query ----------------------------------------------------- */
 typedef struct _MEMORY_BASIC_INFORMATION {
@@ -475,6 +529,11 @@ void  _aligned_free(void *ptr);
 /* ---- Case-insensitive string compare --------------------------------- */
 int _stricmp(const char *a, const char *b);
 int _strnicmp(const char *a, const char *b, SIZE_T n);
+
+/* ---- MSVC CRT "safe" variants ---------------------------------------- */
+/* strtok_s takes the same (str, delim, context) arguments as POSIX strtok_r
+ * and returns the same thing, so the name is all that differs. */
+#define strtok_s strtok_r
 
 /* ---- Wide-string helpers (operate on the 16-bit Xbox WCHAR) ----------
  * Named xbox_wcs* (not macros over wcs*) so they never collide with the
@@ -534,6 +593,8 @@ static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERR
 #ifdef __cplusplus
 }
 #endif
+
+#include "win32_compat_ext.h"
 
 #endif /* !_WIN32 */
 #endif /* WIN32_COMPAT_H */

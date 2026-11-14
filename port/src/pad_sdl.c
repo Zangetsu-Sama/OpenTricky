@@ -29,7 +29,9 @@ int padsdl_on(void)
 }
 
 #ifdef SSX_HAVE_SDL3
+#ifdef _WIN32
 #include <objbase.h>
+#endif
 #include <SDL3/SDL.h>
 
 #define POLL_MS 2               /* the pad thread's period (timeBeginPeriod(1) in main.c) */
@@ -97,11 +99,15 @@ static void set_hints(void)
  * resolve to these copies. */
 static void system_dlls(void)
 {
+#ifndef _WIN32
+    return;
+#else
     static const char *k[] = { "hid.dll", "cfgmgr32.dll" };
     size_t i;
     for (i = 0; i < sizeof k / sizeof k[0]; i++)
         if (!LoadLibraryExA(k[i], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32))
             fprintf(stderr, "[PAD] %s not loaded from the system folder (%lu)\n", k[i], GetLastError());
+#endif
 }
 
 /* Nothing reads SDL's event queue: the state is polled. Every joystick and
@@ -250,7 +256,9 @@ static DWORD WINAPI pad_thread(LPVOID arg)
     (void)arg;
     s_thread_id = GetCurrentThreadId();
     /* The game's own choice (XAudio2, D3D), so SDL keeps it on this thread. */
+#ifdef _WIN32
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#endif
     system_dlls();
     set_hints();
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {

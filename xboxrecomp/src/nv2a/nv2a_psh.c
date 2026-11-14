@@ -727,8 +727,13 @@ int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
 {
     static volatile char lock;
     int n;
-    while (__atomic_test_and_set(&lock, __ATOMIC_ACQUIRE))
+    while (__atomic_test_and_set(&lock, __ATOMIC_ACQUIRE)) {
+#if defined(__x86_64__) || defined(__i386__)
         __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#endif
+    }
     n = psh_generate(st, buf, size);
     __atomic_clear(&lock, __ATOMIC_RELEASE);
     return n;

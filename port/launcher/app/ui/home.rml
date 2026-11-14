@@ -58,7 +58,7 @@
             <div class="drop" id="drop" data-event-click="choose_disc"><b>{{disc_drop1}}</b><span>{{disc_drop2}}</span></div>
             <ul data-if="disc_state == 'warn'">
                 <li><span class="bl"></span>Xbox disc image (.iso or .xiso), USA release</li>
-                <li><span class="bl"></span>Your saves stay in Documents\My Games\SSX Tricky</li>
+                <li id="saves_where"><span class="bl"></span>Your saves stay in Documents\My Games\SSX Tricky</li>
             </ul>
         </div>
 

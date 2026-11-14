@@ -1197,6 +1197,12 @@ int settings_docs_dir(char *out, size_t out_sz)
     CoTaskMemFree(docs);
     if (!ok) return 0;
     return snprintf(out, out_sz, "%s\\My Games\\SSX Tricky", base) < (int)out_sz;
+#elif defined(__APPLE__)
+    const char *home = getenv("OPENTRICKY_DATA_DIR");   /* a folder of one's own (the test runs) */
+    if (home && home[0]) return snprintf(out, out_sz, "%s", home) < (int)out_sz;
+    home = getenv("HOME");
+    if (!home || !home[0]) return 0;
+    return snprintf(out, out_sz, "%s/Library/Application Support/OpenTricky", home) < (int)out_sz;
 #else
     const char *home = getenv("XDG_CONFIG_HOME");
     if (home && home[0]) return snprintf(out, out_sz, "%s/OpenTricky", home) < (int)out_sz;

@@ -5,9 +5,20 @@
 # MMIO interception via VEH (Vectored Exception Handling)
 # Push buffer parsing and command dispatch
 
+if(WIN32)
+    set(NV2A_PGRAPH_SOURCES nv2a_pgraph_d3d11.c)
+else()
+    # POSIX: the NV2A methods go to the executor + Vulkan renderer (nv2a_pgraph_vk.c)
+    # (the executor from SSX3-recomp's toolkit, ../nv2a_exec; the game adds
+    # the Vulkan backend, port/src/vk)
+    set(NV2A_PGRAPH_SOURCES
+        ../nv2a_exec/nv2a_pb_exec.c
+        ../nv2a_exec/nv2a_vsh_interp.c
+        ../nv2a_exec/nv2a_combiner.c)
+endif()
 add_library(xbox_nv2a STATIC
     nv2a_core.c
-    nv2a_pgraph_d3d11.c
+    ${NV2A_PGRAPH_SOURCES}
     nv2a_hdtex.c
     nv2a_btnicons.c
     nv2a_vsh_cpu.c
@@ -19,6 +30,10 @@ add_library(xbox_nv2a STATIC
 )
 
 target_include_directories(xbox_nv2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT WIN32)
+    target_include_directories(xbox_nv2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../nv2a_exec
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernel)
+endif()
 
 if(MSVC)
     target_compile_options(xbox_nv2a PRIVATE

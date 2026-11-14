@@ -28,6 +28,8 @@ void mcpx_apu_shutdown(MCPXAPUState *d);
  * then waits on a status counter; backed by RAM that counter never advances.
  * Returns false if the aperture could not be guarded. */
 bool apu_mmio_install(uint8_t *mem_base);
+/* POSIX: one decoded access (the signal handler does the decoding). */
+bool apu_mmio_access(uint32_t fault_xbox_va, int is_write, unsigned size, uint64_t *val);
 
 #ifdef _WIN32
 #include <windows.h>

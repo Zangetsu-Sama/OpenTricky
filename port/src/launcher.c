@@ -9,6 +9,10 @@
  * that a disc image is the build this executable was recompiled from.
  */
 #include <windows.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <shlobj.h>
 #include <shellapi.h>
 #include <stdio.h>
@@ -24,7 +28,9 @@
 #include "version.h"
 #include "kernel/xbox_xdvdfs.h"
 
+#ifdef _WIN32
 static BOOL to_path(const WCHAR *w, char *out, size_t n);   /* below */
+#endif
 
 /* ── Settings file ─────────────────────────────────────────────────── */
 
@@ -113,6 +119,7 @@ void launcher_init(uint32_t expected_entry_point)
 
 /* UTF-8 (settings.ini) <-> the ANSI paths the runtime opens. A path outside
  * the code page becomes its short 8.3 form, or empty if it has none. */
+#ifdef _WIN32
 static BOOL u8_to_path(const char *u8, char *out, size_t n)
 {
     WCHAR w[MAX_PATH];
@@ -130,6 +137,18 @@ static void path_to_u8(const char *ansi, char *out, size_t n)
     if (ansi[0] && MultiByteToWideChar(CP_ACP, 0, ansi, -1, w, MAX_PATH))
         WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL);
 }
+#else
+/* POSIX: paths are UTF-8 throughout. */
+static BOOL u8_to_path(const char *u8, char *out, size_t n)
+{
+    return snprintf(out, n, "%s", u8) < (int)n;
+}
+
+static void path_to_u8(const char *ansi, char *out, size_t n)
+{
+    snprintf(out, n, "%s", ansi);
+}
+#endif
 
 /* The install root (settings_install_root): the folder of OpenTricky.exe and
  * settings.ini, where the saves (hdd\, portable.txt, Saves\) and a relative
@@ -148,6 +167,7 @@ void launcher_mark_running(void)
         printf("warning: no running mark for the launcher (%lu)\n", (unsigned long)GetLastError());
 }
 
+#ifdef _WIN32
 BOOL launcher_install_root_w(WCHAR *out, size_t n)
 {
     char u8[SETTINGS_VALUE_MAX];
@@ -160,6 +180,7 @@ BOOL launcher_install_root_w(WCHAR *out, size_t n)
     if (k && out[k - 1] == L'\\') out[k - 1] = 0;      /* "D:\" -> "D:": callers add "\<name>" */
     return TRUE;
 }
+#endif
 
 static BOOL is_absolute(const char *p)
 {
@@ -603,6 +624,7 @@ static void config_to_settings(Settings *s, const LauncherConfig *c)
 
 /* "SSX Tricky.log", in the folder of settings.ini (the install root, or
  * Documents when it cannot be written). */
+#ifdef _WIN32
 void launcher_log_path(char *out, size_t out_sz)
 {
     char ini[MAX_PATH], exe[MAX_PATH], *slash, *name, *dot;
@@ -846,6 +868,74 @@ void launcher_open_path(HWND owner, const char *path, BOOL folder)
     }
 }
 
+#else
+/* POSIX (macOS): the log beside settings.ini; the saves in the settings
+ * folder (~/Library/Application Support/OpenTricky/Saves) unless the .ini
+ * names a SaveFolder -- the app bundle itself is not written to. */
+void launcher_log_path(char *out, size_t out_sz)
+{
+    char ini[MAX_PATH], *slash;
+    launcher_config_path(ini, sizeof ini);
+    slash = strrchr(ini, '/');
+    if (slash) slash[1] = '\0'; else ini[0] = '\0';
+    snprintf(out, out_sz, "%sSSX Tricky.log", ini);
+}
+
+static void mkdirs(const char *path)
+{
+    char tmp[MAX_PATH * 2], *c;
+    snprintf(tmp, sizeof tmp, "%s", path);
+    for (c = tmp + 1; *c; c++)
+        if (*c == '/') { *c = 0; mkdir(tmp, 0755); *c = '/'; }
+    mkdir(tmp, 0755);
+}
+
+int launcher_unlock_all(void)
+{
+    const char *e = getenv("XBOX_UNLOCK_ALL");
+    return e && e[0] == '1';
+}
+
+int launcher_unlock_all_folder(char *save_u8, size_t sz)
+{
+    size_t n = strlen(save_u8);
+    while (n && save_u8[n - 1] == '/') save_u8[--n] = '\0';
+    if (!n || n + 1 + strlen(LAUNCHER_UNLOCK_ALL_DIR) >= sz) return 0;
+    strcat(save_u8, "/" LAUNCHER_UNLOCK_ALL_DIR);
+    mkdirs(save_u8);
+    return 1;
+}
+
+int launcher_save_kind(const LauncherConfig *cfg)
+{
+    return cfg->hdd[0] ? LAUNCHER_SAVES_CHOSEN : LAUNCHER_SAVES_DOCUMENTS;
+}
+
+void launcher_hdd_path(const LauncherConfig *cfg, char *out, size_t out_sz)
+{
+    char docs[MAX_PATH];
+    if (cfg->hdd[0] && cfg->hdd[0] == '/') { snprintf(out, out_sz, "%s", cfg->hdd); return; }
+    if (!settings_docs_dir(docs, sizeof docs)) snprintf(docs, sizeof docs, "/tmp/OpenTricky");
+    if (cfg->hdd[0]) snprintf(out, out_sz, "%s/%s", docs, cfg->hdd);
+    else snprintf(out, out_sz, "%s/Saves", docs);
+    mkdirs(out);
+}
+
+void launcher_migrate_saves(const char *save_u8) { (void)save_u8; }
+
+void launcher_open_path(HWND owner, const char *path, BOOL folder)
+{
+    pid_t pid;
+    (void)owner; (void)folder;
+    if (!path || !path[0]) return;
+    pid = fork();
+    if (pid == 0) {
+        execlp("open", "open", path, (char *)NULL);
+        _exit(127);
+    }
+}
+#endif
+
 /* settings.ini as read at start (settings_load), for launcher_config_save:
  * what this window does not change is written back as it was. */
 static Settings s_settings;
@@ -987,6 +1077,7 @@ BOOL launcher_check_iso(const char *path, char *why, size_t why_sz)
 
 /* ── DPI ───────────────────────────────────────────────────────────── */
 
+#ifdef _WIN32
 typedef BOOL (WINAPI *SetDpiCtxFn)(HANDLE);
 typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
 
@@ -999,6 +1090,11 @@ void launcher_enable_dpi_awareness(void)
         SetProcessDPIAware();
 }
 
+#else
+void launcher_enable_dpi_awareness(void) {}
+
+#endif
+#ifdef _WIN32
 /* ── Path helpers ──────────────────────────────────────────────────── */
 
 /* The runtime opens files through the ANSI API, so a path must survive the
@@ -1025,3 +1121,4 @@ static BOOL to_path(const WCHAR *w, char *out, size_t n)
     }
     return TRUE;
 }
+#endif /* _WIN32 */

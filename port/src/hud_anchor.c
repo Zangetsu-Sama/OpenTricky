@@ -407,7 +407,11 @@ static void banner_shot(unsigned long long draw)
         if (at[i] != draw) continue;
         w0 = GetTickCount();
         while (d3d8_ScreenshotPending() && GetTickCount() - w0 < 3000u) Sleep(1);
+#ifdef _WIN32
         _snwprintf(path, MAX_PATH, L"%lsbanner_d%04u.png", pre, at[i]);
+#else
+        swprintf(path, MAX_PATH, L"%lsbanner_d%04u.png", pre, at[i]);
+#endif
         path[MAX_PATH - 1] = 0;
         d3d8_RequestScreenshot(path);
         fprintf(stderr, "[HUD] banner shot at draw %u, frame %u, present %u\n", at[i], s_frame, d3d8_PresentSeq());

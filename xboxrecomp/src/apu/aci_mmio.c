@@ -35,6 +35,7 @@
 
 #include "aci_mmio.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Register file. Reads and writes land here; the side effects below are what
@@ -387,5 +388,31 @@ bool aci_mmio_install(void *mem_base)
 }
 
 #else
-bool aci_mmio_install(void *mem_base) { (void)mem_base; return false; }
+/* POSIX: the aperture is protected (PROT_NONE); the signal handler
+ * (port/src/posix_signals.c) decodes the access and calls aci_mmio_access. */
+#include <sys/mman.h>
+bool aci_mmio_install(void *mem_base)
+{
+    void *page = (uint8_t *)mem_base + XBOX_ACI_MMIO_BASE;
+    int ch;
+    memset(g_aci_regs, 0, sizeof(g_aci_regs));
+    for (ch = 0; ch < ACI_NABM_CHANNELS; ch++)
+        g_aci_regs[ACI_NABM_OFF + ch * ACI_CHANNEL_STRIDE + 0x06] = ACI_SR_DCH;
+    if (mprotect(page, XBOX_ACI_MMIO_SIZE, PROT_NONE) != 0) {
+        fprintf(stderr, "  [ACI] could not guard the aperture -- audio registers stay plain RAM\n");
+        return false;
+    }
+    fprintf(stderr, "  [ACI] AC'97 aperture trapped at Xbox VA 0x%08X (%u bytes)\n",
+            XBOX_ACI_MMIO_BASE, XBOX_ACI_MMIO_SIZE);
+    return true;
+}
+
+bool aci_mmio_access(uint32_t fault_xbox_va, int is_write, unsigned size, uint64_t *val)
+{
+    uint32_t off = fault_xbox_va - XBOX_ACI_MMIO_BASE;
+    if (off >= XBOX_ACI_MMIO_SIZE) return false;
+    if (is_write) aci_write(off, *val, size);
+    else *val = aci_read(off, size);
+    return true;
+}
 #endif /* _WIN32 */

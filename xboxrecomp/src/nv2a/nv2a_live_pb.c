@@ -193,6 +193,14 @@ static int live_pb_bring_up(void)
     D3DPRESENT_PARAMETERS pp;
     HRESULT hr;
 
+#ifndef _WIN32
+    /* macOS: no D3D device to make -- the translator is the NV2A executor and
+     * its Vulkan renderer (port/src/posix/pgraph_vk.c), set up on this thread. */
+    (void)d3d; (void)dev; (void)pp; (void)hr;
+    pgraph_d3d11_init();
+    fprintf(stderr, "[LIVE-PB] live push buffer connected to the NV2A executor\n");
+    return 1;
+#endif
     d3d = xbox_Direct3DCreate8(0);
     if (!d3d) {
         fprintf(stderr, "[LIVE-PB] Direct3DCreate8 failed; live push buffer disabled\n");

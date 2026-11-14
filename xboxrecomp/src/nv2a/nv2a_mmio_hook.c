@@ -452,9 +452,54 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
 
 #else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
 
-bool nv2a_dac_trap_install(uint8_t *mem_base) { (void)mem_base; return false; }
+#include <sys/mman.h>
+#include <unistd.h>
+#include <string.h>
+/* The host page holding the palette (16 KB on Apple silicon: it also holds
+ * the PRAMDAC registers around it). Its other bytes behave as plain memory
+ * through a copy (nv2a_dac_access). */
+static uint8_t  s_dac_shadow[0x10000];
+static uint32_t s_dac_page_va, s_dac_page_len;
+
+bool nv2a_dac_trap_install(uint8_t *mem_base)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    uint32_t len = pg > 0x1000 ? (uint32_t)pg : 0x1000u;
+    uint32_t va = (NV2A_MMIO_BASE + NV2A_PRMDIO_OFFSET) & ~(len - 1);
+    void *page = mem_base + va;
+    if (len > sizeof s_dac_shadow) return false;
+    memcpy(s_dac_shadow, page, len);
+    s_dac_page_va = va;
+    s_dac_page_len = len;
+    if (mprotect(page, len, PROT_NONE) != 0) {
+        fprintf(stderr, "  [DAC] could not trap the palette page -- gamma ramp ignored\n");
+        return false;
+    }
+    fprintf(stderr, "  [DAC] palette registers trapped at Xbox VA 0x%08X (4 KB)\n",
+            NV2A_MMIO_BASE + NV2A_PRMDIO_OFFSET);
+    return true;
+}
 bool nv2a_dac_handle_mmio(PCONTEXT ctx, uint32_t fault_xbox_va, int is_write)
 { (void)ctx; (void)fault_xbox_va; (void)is_write; return false; }
+
+bool nv2a_dac_access(uint32_t fault_xbox_va, int is_write, unsigned size, uint64_t *val)
+{
+    uint32_t off;
+    if (fault_xbox_va < NV2A_MMIO_BASE + NV2A_PRMDIO_OFFSET ||
+        fault_xbox_va >= NV2A_MMIO_BASE + NV2A_PRMDIO_OFFSET + 0x1000u) {
+        /* the rest of the host page: plain memory */
+        uint32_t o = fault_xbox_va - s_dac_page_va;
+        if (!s_dac_page_len || fault_xbox_va < s_dac_page_va || o + size > s_dac_page_len)
+            return false;
+        if (is_write) memcpy(s_dac_shadow + o, val, size);
+        else { *val = 0; memcpy(val, s_dac_shadow + o, size); }
+        return true;
+    }
+    off = fault_xbox_va - NV2A_MMIO_BASE;
+    if (is_write) nv2a_mmio_write(nv2a_get_state(), off, *val, size);
+    else *val = nv2a_mmio_read(nv2a_get_state(), off, size);
+    return true;
+}
 
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 { (void)xbox_mem_offset; }

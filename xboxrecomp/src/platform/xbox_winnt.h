@@ -23,18 +23,13 @@
 #define XBOX_WINNT_H
 
 /* Thread-local storage qualifier (portable).
- * GCC's own __thread keyword is checked first (covers MinGW-on-Windows too,
- * which also defines _WIN32) because __declspec(thread) on this toolchain
- * silently drops the "thread" attribute on `extern` declarations
- * (-Wattributes warns "'thread' attribute directive ignored") -- meaning any
- * translation unit that only sees the extern (not the defining one) would
- * generate ordinary non-TLS access code for what is actually a per-thread
- * variable. __thread does not have that problem and is what this project's
- * real build (MinGW/GCC) actually needs. True MSVC (no __GNUC__) still gets
- * __declspec(thread), which is correct there. */
-#if defined(__GNUC__)
-#define XBOX_THREAD_LOCAL __thread
-#elif defined(_WIN32)
+ *
+ * Keyed on the compiler, not the target. MinGW targets _WIN32 but is GCC, and
+ * GCC ignores __declspec(thread) with nothing but -Wattributes, so every
+ * XBOX_THREAD_LOCAL became one process-wide variable: the current IRQL, the
+ * last host path, the kernel-busy slot. recomp_types.h's RECOMP_TLS already
+ * tests _MSC_VER first for the same reason. */
+#if defined(_MSC_VER)
 #define XBOX_THREAD_LOCAL __declspec(thread)
 #else
 #define XBOX_THREAD_LOCAL __thread
@@ -52,10 +47,17 @@ static inline void xbox_path_normalize(char *p)
 }
 
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX.
- * MinGW already declares a real __debugbreak() via its own headers
- * (windows.h -> _mingw.h), so defining it as a macro here collides with
- * that declaration -- exclude MinGW alongside MSVC. */
-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+ *
+ * The guard has to exclude every _WIN32 host, not just _MSC_VER. MinGW is
+ * neither: it defines _WIN32 but not _MSC_VER, and <_mingw.h> -- reached
+ * through the <windows.h> below -- declares a real __debugbreak(), an inline
+ * that emits int3. Defining a function-like macro of that name first turns
+ * that declaration into an expansion, and the (void) parameter list is read
+ * as an argument: "macro '__debugbreak' passed 1 arguments, but takes just 0".
+ *
+ * Where a Windows SDK exists its own __debugbreak is the better one anyway --
+ * it traps to a debugger, where __builtin_trap() raises SIGILL. */
+#if !defined(_MSC_VER) && !defined(_WIN32)
 #define __debugbreak() __builtin_trap()
 #endif
 
@@ -153,8 +155,33 @@ typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
 /* PCONTEXT: Windows VEH register state. On Linux the equivalent is
  * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
-typedef void              *PCONTEXT;
+ 
+#if defined(__linux__) || defined(__APPLE__)
+/* On gcc these data structures are necessary  even if anyone is going to be used*/
+typedef union Register{
+	uint32_t X; // all register
+	uint8_t SR[4]; // Subregister
+} REG; 
 
+typedef uint32_t  IREG;
+
+typedef struct ProcessorCONTEXT{
+	// General
+	REG EAX;
+	REG EBX;
+	REG ECX;
+	REG EDX;
+	IREG ESI;
+	IREG EDI;
+	IREG ESP;
+	IREG EBP;
+	//  Instruction Pointer Flags
+	IREG EIP;
+	IREG EFlags;
+} *PCONTEXT;
+#else
+typedef void              *PCONTEXT;
+#endif
 /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
 typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
 typedef const uint16_t    *LPCWSTR, *PCWSTR;
@@ -223,6 +250,15 @@ typedef struct _RTL_CRITICAL_SECTION {
  * pthread_cond_t* on POSIX). */
 typedef struct { PVOID Ptr; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
 #define CONDITION_VARIABLE_INIT { NULL }
+
+/* SRWLOCK / INIT_ONCE: same single-pointer layout as Win32, and like it both
+ * are usable from a static initialiser with no explicit Initialize* call.
+ * Ptr is a pthread_rwlock_t* on POSIX. */
+typedef struct { PVOID Ptr; } SRWLOCK, *PSRWLOCK;
+#define SRWLOCK_INIT { NULL }
+
+typedef struct { PVOID Ptr; } INIT_ONCE, *PINIT_ONCE, *LPINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT { NULL }
 
 /* ---- Common small structs ---------------------------------------------- */
 typedef struct _FILETIME   { DWORD dwLowDateTime; DWORD dwHighDateTime; }

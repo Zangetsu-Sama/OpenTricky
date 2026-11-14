@@ -15,6 +15,8 @@
 #define XBOX_ACI_MMIO_BASE  0xFEC00000u
 #define XBOX_ACI_MMIO_SIZE  0x00001000u
 
+/* POSIX: one decoded access (the signal handler does the decoding). */
+bool aci_mmio_access(uint32_t fault_xbox_va, int is_write, unsigned size, uint64_t *val);
 #ifdef _WIN32
 #include <windows.h>
 /* Service a faulting ACI access. Returns true if the instruction was decoded

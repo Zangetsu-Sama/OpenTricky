@@ -26,7 +26,9 @@
  */
 
 #include "xbox_perf.h"
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
 #include <xmmintrin.h>
+#endif
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "xbox_logstats.h"
@@ -4472,8 +4474,12 @@ static LONG CALLBACK trap_nan_veh(EXCEPTION_POINTERS *ep)
         fprintf(stderr, "%s\n", buf);
         fflush(stderr);
     }
+#ifdef _WIN32
     ep->ContextRecord->MxCsr |= 0x0080u;          /* mask IM, retry */
     return EXCEPTION_CONTINUE_EXECUTION;
+#else
+    return EXCEPTION_CONTINUE_SEARCH;              /* POSIX: no FP trap handler */
+#endif
 }
 
 static void trap_nan_check_path(const char *path)
@@ -4493,7 +4499,9 @@ static void kernel_thunk_dispatch(void)
 {
     if (g_trap_nan_armed && !t_trap_nan_on) {
         t_trap_nan_on = 1;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
         _mm_setcsr(_mm_getcsr() & ~0x0080u);   /* unmask invalid (IM) */
+#endif
     }
     xbox_apply_tls_index_once();
     /* Sample the push buffer on the guest's own thread while the translator is

@@ -25,6 +25,13 @@
  * the Windows tools cannot name its functions, and the guest code is one flat
  * sea of generated functions with no frame pointers to walk.
  */
+#ifndef _WIN32
+/* POSIX: the sampling profiler needs SuspendThread/GetThreadContext; off here. */
+#include <stdint.h>
+typedef long long LONGLONG_;
+void xbox_profile_note_stall(long long qpc_start, long long qpc_end) { (void)qpc_start; (void)qpc_end; }
+void xbox_profile_start_from_env(void) {}
+#else
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -335,3 +342,5 @@ void xbox_profile_start_from_env(void)
     h = CreateThread(NULL, 0, prof_main, spec, 0, NULL);
     if (h) CloseHandle(h);
 }
+
+#endif /* _WIN32 */

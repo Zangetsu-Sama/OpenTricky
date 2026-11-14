@@ -15,14 +15,26 @@
 #endif
 #define COBJMACROS
 #include <windows.h>
+#ifdef _WIN32
 #include <wincodec.h>
+#else
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#include "../../third_party/stb/stb_image.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_btnicons.h"
 #include "../kernel/xbox_xdvdfs.h"
 
-BOOL xbox_translate_path(const char *xbox_path, WCHAR *host_path_buf, DWORD buf_size);   /* kernel_path.c */
+#ifdef _WIN32
+typedef WCHAR xbox_host_char;
+#else
+typedef char xbox_host_char;
+#endif
+BOOL xbox_translate_path(const char *xbox_path, xbox_host_char *host_path_buf, DWORD buf_size);   /* kernel_path.c */
 
 #define BCDEC_IMPLEMENTATION
 #define BCDEC_STATIC
@@ -321,6 +333,23 @@ static uint64_t fnv64(const uint8_t *p, uint32_t n)
 }
 
 /* ── Drawings: PNG resources decoded by WIC to straight RGBA ───────────── */
+#ifndef _WIN32
+/* POSIX: stb_image, same output (straight RGBA, at most 1024 x 1024). */
+static int decode_png(const void *data, DWORD size, Img *out)
+{
+    int w = 0, h = 0, n = 0;
+    unsigned char *px = stbi_load_from_memory((const unsigned char *)data, (int)size, &w, &h, &n, 4);
+    if (!px) return 0;
+    if (!w || !h || w > 1024 || h > 1024) { stbi_image_free(px); return 0; }
+    out->rgba = (uint8_t *)malloc((size_t)w * h * 4);
+    if (!out->rgba) { stbi_image_free(px); return 0; }
+    memcpy(out->rgba, px, (size_t)w * h * 4);
+    stbi_image_free(px);
+    out->w = w;
+    out->h = h;
+    return 1;
+}
+#else
 static int decode_png(const void *data, DWORD size, Img *out)
 {
     IWICImagingFactory *f = NULL;
@@ -365,6 +394,7 @@ done:
     if (uninit) CoUninitialize();
     return ok;
 }
+#endif /* _WIN32 */
 
 /* The replay help draws the D-pad disc and the two sticks on a dark
  * background, where the pack's near-black bodies vanish: their dark texels
@@ -1133,9 +1163,13 @@ static int disc_open(const char *rel, DiscFile *d)
         return xdvdfs_find(rel, &d->sector, &d->size, &attrs) && !(attrs & XDVDFS_ATTR_DIRECTORY);
     } else {
         char xp[MAX_PATH];
-        WCHAR wp[MAX_PATH];
+        xbox_host_char wp[MAX_PATH];
         snprintf(xp, sizeof xp, "D:\\%s", rel);
+#ifdef _WIN32
         return xbox_translate_path(xp, wp, MAX_PATH) && (d->f = _wfopen(wp, L"rb")) != NULL;
+#else
+        return xbox_translate_path(xp, wp, MAX_PATH) && (d->f = fopen(wp, "rb")) != NULL;
+#endif
     }
 }
 

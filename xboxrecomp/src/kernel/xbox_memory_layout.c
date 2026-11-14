@@ -1994,6 +1994,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * re-probing the same occupied neighborhood. */
         int found = 0;
 
+#if defined(__APPLE__)
+        /* macOS (as Takedawn's toolkit does): reserve the whole 4 GB guest
+         * window first and map RAM at its base. Every later view (mirrors,
+         * contiguous window, GPU and APU apertures) then replaces the
+         * window's own placeholder (win32_compat.c), so nothing the window
+         * or MoltenVK maps meanwhile can take their place. */
+        {
+            const size_t win = (size_t)1 << 32;
+            void *w = VirtualAlloc(NULL, win, MEM_RESERVE, PAGE_NOACCESS);
+            if (w) {
+                xbox_compat_guest_window(w, win);
+                g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                                0, 0, g_memory_size, w);
+                if (g_memory_base == w) {
+                    found = 1;
+                    fprintf(stderr, "  Base 0x%p: the reserved 4 GB guest window\n", w);
+                } else {
+                    if (g_memory_base) UnmapViewOfFile(g_memory_base);
+                    g_memory_base = NULL;
+                    VirtualFree(w, 0, MEM_RELEASE);
+                }
+            }
+        }
+#endif
+
         /* Test hook (XBOX_TEST_BASE=<hex address>): try this base first,
          * through the same probe as the candidates below. Lets a layout test
          * pick a base whose mirror slots are all free (e.g. one above the
@@ -2095,9 +2120,32 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             int test_reject = rej ? atoi(rej) : 0;
             if (g_memory_base && (test_reject >= 1 ||
                 !xbox_probe_gpu_aperture_free((uintptr_t)g_memory_base))) {
+#if defined(__APPLE__)
+                /* macOS arm64: below 4 GB is the page zero, and the system
+                 * reserves large ranges above it (the shared cache, and on
+                 * recent versions tens of GB more). The first hole that holds
+                 * the whole layout (RAM, its mirrors and the GPU aperture,
+                 * base .. base + 0x100000000), found by walking the regions. */
+                uintptr_t high_bases[4] = { 0x200000000ull, 0x300000000ull, 0x400000000ull, 0 };
+                {
+                    uintptr_t p = 0x100000000ull;
+                    MEMORY_BASIC_INFORMATION q;
+                    while (p < 0x7F0000000000ull && VirtualQuery((LPCVOID)p, &q, sizeof q)) {
+                        uintptr_t start = ((uintptr_t)q.BaseAddress + 0xFFFFFFFull) & ~(uintptr_t)0xFFFFFFFull;
+                        uintptr_t end = (uintptr_t)q.BaseAddress + q.RegionSize;
+                        if (!q.RegionSize) break;
+                        if (q.State == MEM_FREE && end > start && end - start >= 0x110000000ull) {
+                            high_bases[3] = start;
+                            break;
+                        }
+                        p = end;
+                    }
+                }
+#else
                 static const uintptr_t high_bases[] = {
                     0x200000000ull, 0x300000000ull, 0x400000000ull
                 };
+#endif
                 fprintf(stderr, "  Base 0x%p chosen by the OS: rejected -- the GPU MMIO "
                         "aperture would collide; trying fixed bases above 4 GB\n",
                         g_memory_base);
@@ -2105,6 +2153,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 g_memory_base = NULL;
                 for (int i = 0; i < (int)(sizeof(high_bases) / sizeof(high_bases[0])); i++) {
                     uintptr_t hint_addr = high_bases[i];
+                    if (!hint_addr) continue;
                     const char *what = "skipped (slot or aperture occupied)";
                     if (test_reject < 2 && xbox_probe_layout_free(hint_addr, g_memory_size)) {
                         g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,

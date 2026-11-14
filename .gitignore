@@ -70,3 +70,12 @@ hd-hud/
 *.dds
 # The launcher pictures of the HD HUD line show its art: shipped from outside git too.
 port/launcher/app/ui/previews/HdHud-*.png
+build-macos-runtime/
+build-macos-runtime.log
+build-macos-runtime.cfg.log
+build-macos*/
+port/build-macos/
+build/
+game_files/
+dist-macos/
+port/build-launcher-macos/

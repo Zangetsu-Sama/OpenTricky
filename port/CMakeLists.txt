@@ -15,7 +15,9 @@ project(ssx_tricky C CXX)
 
 # The game's icon and manifest (src/ssx_recomp.rc.in) need the resource
 # compiler (windres with MinGW, rc.exe with MSVC).
-enable_language(RC)
+if(WIN32)
+    enable_language(RC)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -36,7 +38,12 @@ if(SSX_PS_PADS)
     set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
     set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
     set(SDL_GPU OFF CACHE BOOL "" FORCE)
-    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    if(APPLE)
+        # macOS: the game window (src/posix/fb_present_sdl3.c) draws with SDL's renderer (Metal)
+        set(SDL_RENDER ON CACHE BOOL "" FORCE)
+    else()
+        set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    endif()
     set(SDL_TRAY OFF CACHE BOOL "" FORCE)
     set(SDL_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/sdl3 ${CMAKE_BINARY_DIR}/sdl3 EXCLUDE_FROM_ALL)
@@ -187,7 +194,6 @@ set(GAME_SOURCES
     src/controls.c
     src/hostui.c
     src/crashreport.c
-    "${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc"
     src/recomp_manual.c
     src/pass_tags.c
     src/fps_cap.c
@@ -237,6 +243,27 @@ message(STATUS "Build identity for crash reports: ${SSX_BUILD_ID}")
 set_source_files_properties(src/crashreport.c PROPERTIES
     COMPILE_DEFINITIONS "SSX_BUILD_ID=\"${SSX_BUILD_ID}\"")
 
+if(WIN32)
+    list(APPEND GAME_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc")
+else()
+    # POSIX (macOS): the Windows-only host files have POSIX stand-ins (src/posix/),
+    # after SSX3-recomp's macOS port.
+    list(REMOVE_ITEM GAME_SOURCES src/crashreport.c src/hostui.c)
+    list(APPEND GAME_SOURCES src/posix/posix_signals.c src/posix/mmio_posix.c src/posix/hostui_posix.c
+         src/posix/xinput_sdl.c src/posix/fb_present_sdl3.c src/posix/pgraph_vk.c src/posix/exec_glue.c src/log.c)
+    # The host files are written against <windows.h>: the stand-in, first.
+    set_source_files_properties(${GAME_SOURCES} PROPERTIES COMPILE_OPTIONS "-include;windows.h")
+    # POSIX: the .rc's RCDATA as a C table (FindResourceA in win32_compat_ext.c).
+    set(SSX_RES_C "${CMAKE_CURRENT_BINARY_DIR}/ssx_resources.c")
+    add_custom_command(OUTPUT "${SSX_RES_C}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/rc_embed.py"
+                "${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc" "${SSX_RES_C}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc" "${CMAKE_CURRENT_SOURCE_DIR}/tools/rc_embed.py"
+                ${SSX_BTNICON_FILES} "${SSX_HDTEX_INDEX}"
+        COMMENT "Embedded resources (POSIX)")
+    list(APPEND GAME_SOURCES "${SSX_RES_C}")
+endif()
+
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
@@ -252,22 +279,38 @@ message(STATUS "Executable will be named: ${GAME_TITLE}.exe")
 
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
+# macOS: the Vulkan renderer (MoltenVK) of SSX3-recomp, src/vk.
+if(APPLE)
+    add_subdirectory(src/vk ${CMAKE_BINARY_DIR}/vk)
+    target_sources(${PROJECT_NAME} PRIVATE src/vk/vkr_backend.c src/vk/vkr_hdtex.c)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/vk
+                               ${XBOXRECOMP_DIR}/src/kernel ${XBOXRECOMP_DIR}/src/nv2a_exec)
+    target_link_libraries(${PROJECT_NAME} PRIVATE vkr SDL3::SDL3-static)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SSX3_VULKAN=1)
+    target_link_options(${PROJECT_NAME} PRIVATE -rdynamic)
+endif()
+
 # Only pad_sdl.c knows about SDL, in a library of its own: SDL's headers and
 # definitions never reach the other sources, and turning SSX_PS_PADS on or
 # off rebuilds nothing else. (SDL's two GameInput sources are C++, empty with
 # MinGW: the game is then linked by g++, with the static runtimes below.)
 add_library(ssx_pad_sdl STATIC src/pad_sdl.c)
+if(NOT WIN32)
+    target_link_libraries(ssx_pad_sdl PRIVATE platform)
+endif()
 if(SSX_PS_PADS)
     target_compile_definitions(ssx_pad_sdl PRIVATE SSX_HAVE_SDL3)
     target_link_libraries(ssx_pad_sdl PRIVATE SDL3::SDL3-static)
 endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE ssx_pad_sdl)
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # no C / C++ runtime DLL beside the game
     target_link_options(${PROJECT_NAME} PRIVATE -static-libstdc++ -static-libgcc)
 endif()
-target_link_libraries(${PROJECT_NAME} PRIVATE dwmapi)
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE dwmapi)
+endif()
 
 # Screenshots (src/hostui.c): the PNG writer of miniz 3.1.2, MIT
 # (third_party/miniz, unmodified, also in the launcher), deflate only.
@@ -286,10 +329,13 @@ endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/posix
+    ${XBOXRECOMP_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
     ${XBOXRECOMP_DIR}/include
 )
 
+if(WIN32)
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
     dxgi
@@ -303,6 +349,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     uuid
     d3dcompiler
 )
+endif()
 
 # Host tests of the settings registry and settings.ini (no game):
 #   cmake -DSSX_BUILD_TESTS=ON ... ; cmake --build ... --target settings_test

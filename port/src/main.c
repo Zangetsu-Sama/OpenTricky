@@ -43,6 +43,11 @@
 #include <math.h>
 #include <io.h>         /* _open_osfhandle, _dup2: the log file's one handle */
 #include <fcntl.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <strings.h>
+#include <pthread.h>
+#endif
 #include "kernel/xbox_logstats.h"
 
 /* xboxrecomp runtime headers */
@@ -178,6 +183,8 @@ static DWORD WINAPI log_flush_thread(LPVOID arg)
  * writing: two streams written at the same moment could land at the same
  * place, one over the other (about a tenth of the bytes lost in a load test
  * of both streams; none this way). The pattern of crashreport_set_output. */
+#ifdef _WIN32
+#define OT_W(x) L##x
 static BOOL log_open_shared(const char *path)
 {
     HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
@@ -194,6 +201,19 @@ static BOOL log_open_shared(const char *path)
     _close(fd);                         /* the two duplicates stay open */
     return TRUE;
 }
+#else
+static BOOL log_open_shared(const char *path)
+{
+    /* POSIX: one descriptor opened to append, both streams on it. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return FALSE;
+    fflush(stdout); fflush(stderr);
+    if (dup2(fd, fileno(stdout)) < 0 || dup2(fd, fileno(stderr)) < 0) { close(fd); return FALSE; }
+    close(fd);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    return TRUE;
+}
+#endif
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -249,6 +269,7 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
  * NULL. Lets a different game/image be pointed at without a rebuild --
  * useful now that the disc is read straight out of an ISO.
  */
+#ifdef _WIN32
 static const char *find_iso_argument(void)
 {
     static char arg[MAX_PATH];
@@ -280,6 +301,31 @@ static BOOL has_flag(const WCHAR *flag)
     LocalFree(wargv);
     return found;
 }
+#else
+#define OT_W(x) x
+int    g_posix_argc;
+char **g_posix_argv;
+static const char *find_iso_argument(void)
+{
+    int i;
+    for (i = 1; i < g_posix_argc; i++) {
+        size_t len = strlen(g_posix_argv[i]);
+        if (len > 4 && strcasecmp(g_posix_argv[i] + len - 4, ".iso") == 0)
+            return g_posix_argv[i];
+    }
+    return NULL;
+}
+
+/* TRUE if `flag` (e.g. "--direct") is on the command line. */
+static BOOL has_flag_a(const char *flag)
+{
+    int i;
+    for (i = 1; i < g_posix_argc; i++)
+        if (strcasecmp(g_posix_argv[i], flag) == 0) return TRUE;
+    return FALSE;
+}
+#define has_flag(f) has_flag_a(f)
+#endif
 
 /*
  * No good disc image in settings.ini (a first start by double-click, a disc
@@ -292,6 +338,7 @@ static BOOL has_flag(const WCHAR *flag)
  * started. The one started here gets --no-skip, so "Skip launcher" cannot
  * send it straight back to a game that refuses the disc image.
  */
+#ifdef _WIN32
 static int open_launcher_instead(const char *why)
 {
     WCHAR exe[MAX_PATH], cmd[MAX_PATH + 16];
@@ -323,6 +370,17 @@ static int open_launcher_instead(const char *why)
     }
     return 0;
 }
+#else
+static int open_launcher_instead(const char *why)
+{
+    /* macOS: the launcher is the app's own front end (it starts the game);
+     * without it, say what is missing. */
+    printf("No good disc image (%s): back to the launcher\n", why);
+    fprintf(stderr, "%s\n\nChoose your SSX Tricky (USA) Xbox disc image in the launcher, "
+            "or start the game with: --direct \"/path/to/SSX Tricky (USA).iso\"\n", why);
+    return OT_EXIT_DISC_REFUSED;
+}
+#endif
 
 /* Direct3D failed for good (d3d8_xbox.h, on the pump thread): no image will
  * ever come. A report, then the message, here only when no launcher will say
@@ -350,6 +408,7 @@ static void gpu_failed(int lost, const char *what, unsigned long hr, unsigned lo
  * standard output at all, and a real console answers GetConsoleMode, so both
  * of those still use settings.ini.
  */
+#ifdef _WIN32
 static BOOL output_is_redirected(void)
 {
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -358,6 +417,13 @@ static BOOL output_is_redirected(void)
     if (GetConsoleMode(h, &mode)) return FALSE;
     return GetFileType(h) != FILE_TYPE_UNKNOWN;
 }
+#else
+static BOOL output_is_redirected(void)
+{
+    /* A pipe or a file (test harnesses); a terminal is a person. */
+    return !isatty(fileno(stdout));
+}
+#endif
 
 /*
  * Read a whole file out of the mounted disc image into a freshly allocated
@@ -394,6 +460,7 @@ static BOOL load_xbe_from_iso(const char *rel_path, void **out_data, size_t *out
  * UNC share) untouched -- used for a path the user typed. */
 static void resolve_from_exe(const char *rel, char *out, size_t out_sz);
 
+#ifdef _WIN32
 static void resolve_from_exe_or_absolute(const char *p, char *out, size_t out_sz)
 {
     BOOL absolute = (p[0] && p[1] == ':') || (p[0] == '\\' && p[1] == '\\');
@@ -454,6 +521,31 @@ static void resolve_from_exe_u8(const char *rel, char *out, size_t out_sz)
     if (!WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)out_sz, NULL, NULL))
         snprintf(out, out_sz, "%s", rel);
 }
+#else
+static void resolve_from_exe_or_absolute(const char *p, char *out, size_t out_sz)
+{
+    if (p[0] == '/') snprintf(out, out_sz, "%s", p);
+    else resolve_from_exe(p, out, out_sz);
+}
+
+/* POSIX: the executable's folder + rel (backslashes as slashes), made absolute. */
+static void resolve_from_exe(const char *rel, char *out, size_t out_sz)
+{
+    char exe[MAX_PATH], joined[MAX_PATH * 2], *slash, *c;
+    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+    if (n == 0 || n >= sizeof(exe)) { snprintf(out, out_sz, "%s", rel); return; }
+    slash = strrchr(exe, '/');
+    if (slash) *slash = '\0'; else exe[0] = '\0';
+    snprintf(joined, sizeof(joined), "%s/%s", exe, rel);
+    for (c = joined; *c; c++) if (*c == '\\') *c = '/';
+    if (!realpath(joined, out)) snprintf(out, out_sz, "%s", joined);
+}
+
+static void resolve_from_exe_u8(const char *rel, char *out, size_t out_sz)
+{
+    resolve_from_exe(rel, out, out_sz);
+}
+#endif
 
 /* Recompiled entry point (generated by recomp pipeline) */
 extern void xbe_entry_point(void);
@@ -479,6 +571,7 @@ extern size_t recomp_dispatch_init(void);
  * the top of the thread's stack. A fault near the top of a shallow stack (a
  * thread that just started) otherwise faulted again inside this handler,
  * and that second fault is the one that got reported. */
+#ifdef _WIN32
 static uintptr_t veh_stack_end(PEXCEPTION_POINTERS ep)
 {
     uintptr_t end = (uintptr_t)ep->ContextRecord->Rsp + 0x2000;
@@ -704,6 +797,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif /* _WIN32 */
 
 /*
  * Who reads guest VA 8 / 0xC?
@@ -823,7 +917,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     launcher_enable_dpi_awareness();
 
     /* Install VEH handler (first handler in chain) */
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, veh_handler);
+#endif
 
 
 
@@ -874,8 +970,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     launcher_config_load(&launch_cfg);
     {
         const char *cli = find_iso_argument();
-        BOOL direct = has_flag(L"--direct") || cli != NULL ||
-                      (output_is_redirected() && !has_flag(L"--play"));
+        BOOL direct = has_flag(OT_W("--direct")) || cli != NULL ||
+                      (output_is_redirected() && !has_flag(OT_W("--play")));
         use_config = !direct;
 
         if (use_config) {
@@ -1430,6 +1526,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             launcher_migrate_saves(save_dir);  /* saves an earlier version put in a misnamed folder */
         } else
             resolve_from_exe_u8(YOUR_GAME_SAVE_DIR, save_dir, sizeof(save_dir));
+#ifndef _WIN32
+        {   /* macOS: the app keeps its saves beside itself (macos/OpenTricky.sh) */
+            const char *sd = getenv("OPENTRICKY_SAVE_DIR");
+            if (sd && *sd) snprintf(save_dir, sizeof save_dir, "%s", sd);
+        }
+#endif
         /* Save profile Unlock all: a save of its own, below the save folder,
          * whenever the cheat is on (settings.ini or XBOX_UNLOCK_ALL) -- the
          * player's own save is never opened with everything unlocked. */
@@ -1437,7 +1539,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             /* no room for it: never the player's folder, the default one's */
             resolve_from_exe_u8(YOUR_GAME_SAVE_DIR, save_dir, sizeof(save_dir));
             if (!launcher_unlock_all_folder(save_dir, sizeof(save_dir))) {
-                _putenv_s("XBOX_UNLOCK_ALL", "0");      /* no folder of its own: no cheat */
+                setenv("XBOX_UNLOCK_ALL", "0", 1);      /* no folder of its own: no cheat */
                 printf("Unlock all: off (no room for its save folder)\n");
             }
         }
@@ -1636,6 +1738,59 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
  * (a single store, measured free), which turns a bare fault into the guest
  * address that was executing when it happened.
  * ------------------------------------------------------------------ */
+#ifndef _WIN32
+/* POSIX: crashes and the device registers are the signal handler's
+ * (posix_signals.c), installed by crashreport_install. The game runs on its
+ * own thread; on macOS the main thread runs the window loop, as in
+ * SSX3-recomp's macOS port. */
+extern void xbox_FramebufferMainThreadRun(void);
+extern void xbox_FramebufferMainThreadQuit(void);
+static int s_posix_rc;
+static void *posix_game_thread(void *arg)
+{
+    (void)arg;
+    s_posix_rc = WinMain(NULL, NULL, NULL, 0);
+    xbox_FramebufferMainThreadQuit();
+    return NULL;
+}
+
+int main(int argc, char **argv)
+{
+    pthread_attr_t a;
+    pthread_t th;
+    g_posix_argc = argc;
+    g_posix_argv = argv;
+    crashreport_install();
+#if defined(__APPLE__)
+    /* RECOMP_RES: the Vulkan renderer's internal resolution, as a frame
+     * height (SSX3-recomp's macOS default): the main display's height in
+     * pixels, so the picture is drawn at the screen's own resolution (Retina)
+     * rather than 640x480 stretched; the game still gets 640x480.
+     * RECOMP_RES=1: the original resolution. */
+    if (!getenv("RECOMP_RES")) {
+        extern void *CGDisplayCopyDisplayMode(uint32_t display);
+        extern uint32_t CGMainDisplayID(void);
+        extern size_t CGDisplayModeGetPixelHeight(void *mode);
+        extern void CGDisplayModeRelease(void *mode);
+        void *m = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        size_t h = m ? CGDisplayModeGetPixelHeight(m) : 0;
+        char buf[16];
+        if (m) CGDisplayModeRelease(m);
+        snprintf(buf, sizeof buf, "%u", (unsigned)(h >= 480 ? h : 1080));
+        setenv("RECOMP_RES", buf, 1);
+        printf("Render:     %s lines (RECOMP_RES, the display's height)\n", buf);
+    }
+#endif
+    /* guest call chains are native call chains: a big stack */
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 256u << 20);
+    if (pthread_create(&th, &a, posix_game_thread, NULL) != 0)
+        return WinMain(NULL, NULL, NULL, 0);
+    xbox_FramebufferMainThreadRun();
+    pthread_join(th, NULL);
+    return s_posix_rc;
+}
+#else
 extern volatile unsigned g_last_loc;
 
 static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
@@ -1717,3 +1872,4 @@ int main(int argc, char **argv)
     (void)argv;
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
 }
+#endif /* _WIN32 */

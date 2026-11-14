@@ -543,7 +543,7 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#elif !defined(XBOX_APU_SDL3) /* POSIX stubs (macOS: apu_sdl3.c) */
 
 int  xa2_init(void)                                   { return 0; }
 void xa2_shutdown(void)                               {}

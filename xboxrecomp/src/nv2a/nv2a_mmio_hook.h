@@ -54,6 +54,8 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va);
 /* Trap only the PRMDIO page (DAC palette = gamma ramp) and
  * route its faults to the NV2A register handlers. */
 bool nv2a_dac_trap_install(uint8_t *mem_base);
+/* POSIX: one decoded access to the palette page. */
+bool nv2a_dac_access(uint32_t fault_xbox_va, int is_write, unsigned size, uint64_t *val);
 bool nv2a_dac_handle_mmio(PCONTEXT ctx, uint32_t fault_xbox_va, int is_write);
 
 #endif /* BURNOUT3_NV2A_MMIO_HOOK_H */

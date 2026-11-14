@@ -25,6 +25,11 @@ if(WIN32)
         d3d8_vsh.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler windowscodecs ole32)
+elseif(APPLE)
+    # macOS: the D3D8 host calls the game makes, over the executor + Vulkan
+    # renderer and the SDL3 window (d3d8_posix.c)
+    add_library(xbox_d3d8 STATIC d3d8_posix.c)
+    target_link_libraries(xbox_d3d8 PUBLIC platform)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c

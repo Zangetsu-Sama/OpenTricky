@@ -5,28 +5,43 @@
  * (threads/events/mutexes/atomics/heap/timers) -- it carries no Xbox
  * semantics. The Xbox kernel HLE in src/kernel builds on top of it.
  *
- * Linux/POSIX only.
+ * POSIX (Linux/MacOS) only.
  */
 
 #if !defined(_WIN32)
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
 #define _GNU_SOURCE
+/* Darwin: exposes memset_s, its explicit_bzero equivalent. */
+#define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
 
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
 #include <time.h>
+#include <signal.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/stat.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#else
+#if !defined(__EMSCRIPTEN__)
 #include <sys/sysinfo.h>
+#endif
+#endif
 
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
@@ -47,6 +62,12 @@ LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
+{
+    __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return cmp;
+}
+
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGLONG cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return cmp;
@@ -114,11 +135,77 @@ VOID DeleteCriticalSection(LPCRITICAL_SECTION cs)
 }
 
 /* ===================================================================== */
+/* Slim reader/writer locks                                              */
+/* ===================================================================== */
+
+/* An SRWLOCK is usable straight from SRWLOCK_INIT, so the pthread_rwlock_t
+ * behind it has to appear on first use. Unlike the condition variables below
+ * -- whose lazy init is covered by the caller holding the paired CRITICAL
+ * SECTION -- an SRWLOCK is by definition taken from several threads at once
+ * with nothing else held, so first use genuinely races. Serialise just that:
+ * once Ptr is published, every acquire is a plain atomic load. */
+static pthread_rwlock_t *srw_lazy_init(PSRWLOCK lock)
+{
+    pthread_rwlock_t *rw = __atomic_load_n((pthread_rwlock_t **)&lock->Ptr,
+                                           __ATOMIC_ACQUIRE);
+    if (!rw) {
+        static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&init_lock);
+        rw = (pthread_rwlock_t *)lock->Ptr;
+        if (!rw) {
+            rw = (pthread_rwlock_t *)malloc(sizeof(*rw));
+            pthread_rwlock_init(rw, NULL);
+            __atomic_store_n((pthread_rwlock_t **)&lock->Ptr, rw, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&init_lock);
+    }
+    return rw;
+}
+
+VOID InitializeSRWLock(PSRWLOCK lock)
+{
+    lock->Ptr = NULL;
+    srw_lazy_init(lock);
+}
+
+VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+
+/* ===================================================================== */
+/* One-time initialisation                                               */
+/* ===================================================================== */
+
+/* Win32 semantics: the callback runs at most once for a given INIT_ONCE, and
+ * a callback returning FALSE leaves it un-run so a later call retries. Ptr
+ * doubles as the "done" flag. One global mutex covers every INIT_ONCE --
+ * initialisation is rare, and the fast path never touches it. */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context)
+{
+    static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    if (__atomic_load_n(&once->Ptr, __ATOMIC_ACQUIRE))
+        return TRUE;
+
+    pthread_mutex_lock(&once_lock);
+    BOOL ok = TRUE;
+    if (!once->Ptr) {
+        ok = fn(once, param, context);
+        if (ok)
+            __atomic_store_n(&once->Ptr, (PVOID)1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&once_lock);
+    return ok;
+}
+
+/* ===================================================================== */
 /* Condition variables (paired with a CRITICAL_SECTION)                  */
 /* ===================================================================== */
 
 /* Forward decl; the definition lives further down with the wait helpers. */
 static void deadline_from_ms(DWORD ms, struct timespec *ts);
+static int cond_wait_until(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *mono);
 
 static void cv_lazy_init(PCONDITION_VARIABLE cv)
 {
@@ -148,7 +235,7 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
     }
     struct timespec ts;
     deadline_from_ms(ms, &ts);
-    int rc = pthread_cond_timedwait(c, m, &ts);
+    int rc = cond_wait_until(c, m, &ts);
     if (rc == ETIMEDOUT) { SetLastError(WAIT_TIMEOUT); return FALSE; }
     return TRUE;
 }
@@ -170,12 +257,13 @@ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
 /* ===================================================================== */
 
 typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
-               K_FILEMAP, K_FILE } w32_kind;
+               K_FILEMAP, K_FILE, K_WAITABLE_TIMER } w32_kind;
 
 #define W32_MAX_APC 16
 
 typedef struct w32_object {
     w32_kind        kind;
+    uint32_t        hid;            /* slot in the handle table (0: none) */
     LONG            refcount;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
@@ -183,6 +271,9 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    int             waiters;      /* threads blocked in wait_single on it */
+    unsigned        pulse_gen;    /* bumped by PulseEvent */
+    int             pulse_avail;  /* waiters a pulse may still release */
 
     /* semaphore */
     long            sem_count;
@@ -214,10 +305,22 @@ typedef struct w32_object {
     WAITORTIMERCALLBACK timer_cb;
     PVOID           timer_param;
 
+    /* waitable timer */
+    int             waitable_manual_reset;
+    struct timespec waitable_due_time;
+    int             waitable_triggered;
+    int             waitable_armed;
+
     /* file mapping / fd-backed file handle */
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+
+    /* a file or directory inside the mounted disc image (kernel/xiso.c):
+     * 0 = an ordinary host file; 1 = image file, 2 = image directory */
+    int             iso_kind;
+    int             iso_node;
+    unsigned long long iso_off, iso_size, iso_pos;
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -226,6 +329,8 @@ typedef struct w32_object {
 #define STILL_ACTIVE 259u
 
 static __thread w32_object *t_self_obj = NULL;
+static inline HANDLE O2H(w32_object *o);       /* the handle table, below */
+static inline w32_object *H2O(HANDLE h);
 static __thread DWORD       t_tid      = 0;
 static volatile LONG        s_next_tid = 1000;
 
@@ -237,8 +342,56 @@ DWORD GetCurrentThreadId(void)
 }
 
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
-HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
+HANDLE GetCurrentThread(void)   { return t_self_obj ? O2H(t_self_obj) : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
+
+/* ---- handle values ----------------------------------------------------
+ * OpenTricky: handles are small numbers, as Win32's are, not pointers. The
+ * Xbox kernel bridge stores a raw thread handle in 32-bit guest memory and
+ * tells a raw handle from a guest object by its value (below 0x10000,
+ * kernel_bridge.c xbox_resolve_dispatcher_handle). A handle is 4 * slot. */
+#define W32_HMAX 0x3FFF
+static w32_object *g_hobj[W32_HMAX + 1];
+static pthread_mutex_t g_hlock = PTHREAD_MUTEX_INITIALIZER;
+
+static void h_register(w32_object *o)
+{
+    static uint32_t next = 1;
+    uint32_t i, k;
+    pthread_mutex_lock(&g_hlock);
+    for (k = 0; k < W32_HMAX; k++) {
+        i = next + k;
+        if (i > W32_HMAX) i -= W32_HMAX;
+        if (!g_hobj[i]) { g_hobj[i] = o; o->hid = i; next = i + 1; break; }
+    }
+    pthread_mutex_unlock(&g_hlock);
+    if (!o->hid) fprintf(stderr, "[W32] handle table full: a pointer handle\n");
+}
+
+static void h_unregister(w32_object *o)
+{
+    if (!o->hid) return;
+    pthread_mutex_lock(&g_hlock);
+    if (g_hobj[o->hid] == o) g_hobj[o->hid] = NULL;
+    pthread_mutex_unlock(&g_hlock);
+    o->hid = 0;
+}
+
+static inline HANDLE O2H(w32_object *o)
+{
+    if (!o) return NULL;
+    return o->hid ? (HANDLE)(uintptr_t)(o->hid * 4u) : (HANDLE)o;
+}
+
+static inline w32_object *H2O(HANDLE h)
+{
+    uintptr_t v = (uintptr_t)h;
+    if (!v) return NULL;
+    if (v < 4u * (W32_HMAX + 1) && !(v & 3)) return g_hobj[v / 4];
+    if (v >= 0x100000000ull && (v >> 32) != 0x1500D15Cu)   /* a pointer handle (table full) */
+        return H2O(h);
+    return NULL;                       /* not one of ours (an ISO handle, a synthetic one) */
+}
 
 static w32_object *obj_alloc(w32_kind kind)
 {
@@ -248,6 +401,7 @@ static w32_object *obj_alloc(w32_kind kind)
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    h_register(o);
     return o;
 }
 
@@ -260,10 +414,13 @@ static void obj_release(w32_object *o)
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
         if (o->fd >= 0) close(o->fd);
+    } else if (o->kind == K_WAITABLE_TIMER) {
+        /* Waitable timers: no special cleanup needed */
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
     pthread_cond_destroy(&o->gate);
+    h_unregister(o);
     free(o);
 }
 
@@ -273,18 +430,44 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     w32_object *o = obj_alloc(K_FILE);
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
-    return (HANDLE)o;
+    return O2H(o);
 }
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = H2O(h);
     return (o && o->kind == K_FILE) ? o->fd : -1;
+}
+
+void w32_handle_set_iso(HANDLE h, int kind, unsigned long long off,
+                        unsigned long long size, int node)
+{
+    w32_object *o = H2O(h);
+    if (!o || o->kind != K_FILE)
+        return;
+    o->iso_kind = kind;
+    o->iso_off  = off;
+    o->iso_size = size;
+    o->iso_node = node;
+    o->iso_pos  = 0;
+}
+
+int w32_handle_iso(HANDLE h, unsigned long long *off, unsigned long long *size,
+                   int *node, unsigned long long **pos)
+{
+    w32_object *o = H2O(h);
+    if (!o || o->kind != K_FILE || !o->iso_kind)
+        return 0;
+    if (off)  *off  = o->iso_off;
+    if (size) *size = o->iso_size;
+    if (node) *node = o->iso_node;
+    if (pos)  *pos  = &o->iso_pos;
+    return o->iso_kind;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = H2O(h);
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
@@ -293,7 +476,10 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    obj_release((w32_object *)h);
+    {
+        w32_object *o = H2O(h);
+        if (o) obj_release(o);
+    }
     return TRUE;
 }
 
@@ -305,7 +491,8 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
-    w32_object *o = (w32_object *)src;
+    w32_object *o = H2O(src);
+    if (!o) { *dst = src; return TRUE; }
     InterlockedIncrement(&o->refcount);
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
@@ -314,9 +501,45 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
 }
 
 /* ---- deadline helper -------------------------------------------------- */
+/* Deadlines are on the monotonic clock: Win32 timeouts are relative, and a
+ * wall-clock step (NTP, a manual change, waking from sleep) must not stretch
+ * or cut them -- the kernel timer/vblank thread waits like this. */
+static int cond_wait_until(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *mono)
+{
+    struct timespec now, rel;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    rel.tv_sec  = mono->tv_sec - now.tv_sec;
+    rel.tv_nsec = mono->tv_nsec - now.tv_nsec;
+    if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000L; }
+    if (rel.tv_sec < 0) return ETIMEDOUT;
+#if defined(__APPLE__)
+    return pthread_cond_timedwait_relative_np(c, m, &rel);
+#else
+    {
+        /* Conditions use the default (realtime) clock here: turn the
+         * remaining time into a realtime deadline at the last moment, so a
+         * clock step can only affect this one slice, which the callers
+         * re-check against the monotonic deadline. */
+        struct timespec abs;
+        clock_gettime(CLOCK_REALTIME, &abs);
+        abs.tv_sec  += rel.tv_sec;
+        abs.tv_nsec += rel.tv_nsec;
+        if (abs.tv_nsec >= 1000000000L) { abs.tv_sec++; abs.tv_nsec -= 1000000000L; }
+        int rc = pthread_cond_timedwait(c, m, &abs);
+        if (rc == ETIMEDOUT) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec < mono->tv_sec ||
+                (now.tv_sec == mono->tv_sec && now.tv_nsec < mono->tv_nsec))
+                rc = 0;   /* the wall clock jumped ahead: a spurious wake */
+        }
+        return rc;
+    }
+#endif
+}
+
 static void deadline_from_ms(DWORD ms, struct timespec *ts)
 {
-    clock_gettime(CLOCK_REALTIME, ts);
+    clock_gettime(CLOCK_MONOTONIC, ts);
     ts->tv_sec  += ms / 1000;
     ts->tv_nsec += (long)(ms % 1000) * 1000000L;
     if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
@@ -344,6 +567,24 @@ static int drain_apcs(void)
     return run;
 }
 
+static int timespec_before(const struct timespec *a, const struct timespec *b)
+{
+    return a->tv_sec != b->tv_sec ? a->tv_sec < b->tv_sec : a->tv_nsec < b->tv_nsec;
+}
+
+/* Signalled once the due time passes; latched, so a manual-reset timer stays
+ * signalled until it is set or cancelled again. Caller holds o->lock. */
+static int waitable_due(w32_object *o)
+{
+    struct timespec now;
+    if (o->waitable_triggered) return 1;
+    if (!o->waitable_armed) return 0;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (timespec_before(&now, &o->waitable_due_time)) return 0;
+    o->waitable_triggered = 1;
+    return 1;
+}
+
 /*
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
@@ -356,28 +597,59 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    unsigned pulse0 = o->pulse_gen;
+    int pulsed = 0, counted = 0;
 
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+            ready = o->signaled;
+            /* A PulseEvent since this wait began releases it once. */
+            if (!ready && counted && o->pulse_gen != pulse0 && o->pulse_avail > 0) {
+                o->pulse_avail--;
+                ready = pulsed = 1;
+            }
+            break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
             ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
             break;
+        case K_WAITABLE_TIMER: ready = waitable_due(o); break;
         default:       ready = 1; break;
         }
         if (ready) break;
+        if (o->kind == K_EVENT && !counted) {
+            o->waiters++;
+            counted = 1;
+        }
 
-        int rc = timed ? pthread_cond_timedwait(&o->cond, &o->lock, &ts)
-                       : pthread_cond_wait(&o->cond, &o->lock);
-        if (rc == ETIMEDOUT) { result = WAIT_TIMEOUT; break; }
+        /* An armed timer has its own deadline. Waiting on the caller's alone
+         * would sleep straight past the due time, so take whichever comes
+         * first and re-test. */
+        struct timespec until = ts;
+        int bounded = timed;
+        if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
+            (!timed || timespec_before(&o->waitable_due_time, &ts))) {
+            until = o->waitable_due_time;
+            bounded = 1;
+        }
+        int rc = bounded ? cond_wait_until(&o->cond, &o->lock, &until)
+                         : pthread_cond_wait(&o->cond, &o->lock);
+        if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
+            result = WAIT_TIMEOUT; break;
+        }
     }
 
+    if (counted)
+        o->waiters--;
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_EVENT: if (!o->manual_reset && !pulsed) o->signaled = 0; break;
+        case K_WAITABLE_TIMER:
+            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
+            break;
         case K_SEM:   o->sem_count--; break;
         case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
         default: break;
@@ -387,11 +659,31 @@ static DWORD wait_single(w32_object *o, DWORD ms)
     return result;
 }
 
+/* Would a wait on h succeed now? Does not consume anything. */
+static int obj_ready_peek(HANDLE h)
+{
+    w32_object *o = H2O(h);
+    int ready;
+    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return 1;
+    pthread_mutex_lock(&o->lock);
+    switch (o->kind) {
+    case K_EVENT:  ready = o->signaled; break;
+    case K_THREAD: ready = o->exited;   break;
+    case K_SEM:    ready = (o->sem_count > 0); break;
+    case K_MUTEX:  ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId()); break;
+    case K_WAITABLE_TIMER: ready = waitable_due(o); break;
+    default:       ready = 1; break;
+    }
+    pthread_mutex_unlock(&o->lock);
+    return ready;
+}
+
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    return wait_single(H2O(h), ms);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -422,10 +714,17 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
             return WAIT_IO_COMPLETION;
 
         if (waitAll) {
+            /* Look first, take only when every object is ready: taking them
+             * one by one consumed auto-reset events, semaphore counts and
+             * mutexes of a set that was not complete yet. */
             DWORD got = 0;
             for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
-            if (got == count) return WAIT_OBJECT_0;
+                if (obj_ready_peek(handles[i])) got++;
+            if (got == count) {
+                for (DWORD i = 0; i < count; i++)
+                    WaitForSingleObject(handles[i], 0);
+                return WAIT_OBJECT_0;
+            }
         } else {
             for (DWORD i = 0; i < count; i++)
                 if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
@@ -434,7 +733,7 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
 
         if (timed) {
             struct timespec now;
-            clock_gettime(CLOCK_REALTIME, &now);
+            clock_gettime(CLOCK_MONOTONIC, &now);
             if (now.tv_sec > ts.tv_sec ||
                 (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec))
                 return WAIT_TIMEOUT;
@@ -453,7 +752,7 @@ HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
     w32_object *o = obj_alloc(K_EVENT);
     o->manual_reset = manualReset ? 1 : 0;
     o->signaled     = initialState ? 1 : 0;
-    return (HANDLE)o;
+    return O2H(o);
 }
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCWSTR name)
 {
@@ -463,7 +762,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = H2O(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -474,7 +773,7 @@ BOOL SetEvent(HANDLE h)
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = H2O(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
@@ -484,11 +783,18 @@ BOOL ResetEvent(HANDLE h)
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = H2O(h);
     if (!o || o->kind != K_EVENT) return FALSE;
+    /* Win32: release the threads already waiting (all of them for a
+     * manual-reset event, one for auto-reset) and leave the event reset. The
+     * old version set and cleared the flag under the lock, so the woken
+     * waiters saw it cleared and slept on: a pulse released nobody. */
     pthread_mutex_lock(&o->lock);
-    o->signaled = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (o->waiters > 0) {
+        o->pulse_gen++;
+        o->pulse_avail = o->manual_reset ? o->waiters : 1;
+        pthread_cond_broadcast(&o->cond);
+    }
     o->signaled = 0;
     pthread_mutex_unlock(&o->lock);
     return TRUE;
@@ -504,7 +810,7 @@ HANDLE CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
     w32_object *o = obj_alloc(K_SEM);
     o->sem_count = initial;
     o->sem_max   = maximum;
-    return (HANDLE)o;
+    return O2H(o);
 }
 HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name)
 {
@@ -514,7 +820,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = H2O(h);
     if (!o || o->kind != K_SEM) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
@@ -534,7 +840,7 @@ HANDLE CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCSTR name)
     (void)sa; (void)name;
     w32_object *o = obj_alloc(K_MUTEX);
     if (initialOwner) { o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion = 1; }
-    return (HANDLE)o;
+    return O2H(o);
 }
 HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 {
@@ -544,10 +850,18 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_MUTEX) return FALSE;
+    w32_object *o = H2O(h);
+    if (!o || o->kind != K_MUTEX) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
-    if (o->mtx_owner == GetCurrentThreadId() && --o->mtx_recursion <= 0) {
+    if (o->mtx_owner != GetCurrentThreadId()) {
+        pthread_mutex_unlock(&o->lock);
+        SetLastError(ERROR_NOT_OWNER);
+        return FALSE;
+    }
+    if (--o->mtx_recursion <= 0) {
         o->mtx_owner = 0;
         o->mtx_recursion = 0;
         pthread_cond_broadcast(&o->cond);
@@ -599,8 +913,14 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    if (stackSize)
-        pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
+    /* Guest call chains are native call chains, so guest threads need deep
+     * stacks. Win32 reserves at least 1 MB (the size passed is a commit);
+     * the pthread default is only 512 KB on macOS. 8 MB everywhere, as the
+     * Linux default: address space, not memory, until it is touched. */
+    {
+        SIZE_T want = stackSize > (8u << 20) ? stackSize : (SIZE_T)(8u << 20);
+        pthread_attr_setstacksize(&attr, want);
+    }
 
     if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&attr);
@@ -613,7 +933,7 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     o->thread_joinable = 1;
 
     if (threadId) *threadId = o->tid;
-    return (HANDLE)o;
+    return O2H(o);
 }
 
 VOID ExitThread(DWORD exitCode)
@@ -633,7 +953,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : H2O(h);
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -643,7 +963,7 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : H2O(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -657,7 +977,9 @@ DWORD SuspendThread(HANDLE h)
 {
     /* True mid-run suspension is not supported on POSIX; only the
      * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
+    /* NtCurrentThread() arrives as the pseudo handle: it used to be read as
+     * an object at 0xFF..FE and crash. */
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : H2O(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -668,7 +990,7 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : H2O(h);
     if (!o || o->kind != K_THREAD) return FALSE;
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
@@ -682,22 +1004,42 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : H2O(h);
     if (o && o->kind == K_THREAD) o->priority = priority;
-    return TRUE;   /* real RT priorities need privileges; tracked only */
+#if defined(__APPLE__)
+    /* Real priorities need privileges; macOS's QoS classes do not, but only
+     * apply to the calling thread. The audio clock, the tick thread and
+     * guest threads raising themselves get the interactive class. */
+    if (h == PSEUDO_CURRENT_THREAD || (o && o == t_self_obj)) {
+        qos_class_t q = priority >= THREAD_PRIORITY_HIGHEST ? QOS_CLASS_USER_INTERACTIVE
+                      : priority > THREAD_PRIORITY_NORMAL  ? QOS_CLASS_USER_INITIATED
+                      : priority < THREAD_PRIORITY_NORMAL  ? QOS_CLASS_UTILITY
+                      : QOS_CLASS_DEFAULT;
+        pthread_set_qos_class_self_np(q, 0);
+    }
+#endif
+    return TRUE;   /* elsewhere tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : H2O(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+}
+
+DWORD GetThreadId(HANDLE h)
+{
+    w32_object *o;
+    if (h == PSEUDO_CURRENT_THREAD) return GetCurrentThreadId();
+    o = H2O(h);
+    return (o && o->kind == K_THREAD) ? o->tid : 0;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : H2O(thread);
     if (!o || o->kind != K_THREAD) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
@@ -758,7 +1100,7 @@ static void *timer_thread(void *arg)
 HANDLE CreateTimerQueue(void)
 {
     /* A timer queue is just a grouping token here. */
-    return (HANDLE)obj_alloc(K_TIMER);
+    return O2H(obj_alloc(K_TIMER));
 }
 
 BOOL DeleteTimerQueue(HANDLE timerQueue)
@@ -785,14 +1127,14 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
         return FALSE;
     }
     pthread_detach(o->thread);
-    if (newTimer) *newTimer = (HANDLE)o;
+    if (newTimer) *newTimer = O2H(o);
     return TRUE;
 }
 
 BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = H2O(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_due    = dueTime;
     o->timer_period = period;
@@ -802,7 +1144,7 @@ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG
 BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = H2O(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_cancel = 1;
     if (completionEvent) SetEvent(completionEvent);
@@ -830,6 +1172,72 @@ BOOL TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
     pthread_t th;
     if (pthread_create(&th, NULL, w32_tp_trampoline, a) != 0) { free(a); return FALSE; }
     pthread_detach(th);
+    return TRUE;
+}
+
+/* ===================================================================== */
+/* Waitable timers                                                       */
+/* ===================================================================== */
+
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
+{
+    (void)sa;
+    (void)name;
+    w32_object *o = obj_alloc(K_WAITABLE_TIMER);
+    o->waitable_manual_reset = manualReset;
+    return O2H(o);
+}
+
+BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                      PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
+{
+    w32_object *o = H2O(h);
+    (void)completion; (void)arg; (void)resume;
+    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    /* Win32 100ns units: negative is relative to now, positive is an absolute
+     * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
+     * title actually arms a repeating timer. */
+    if (dueTime->QuadPart <= 0) {
+        clock_gettime(CLOCK_MONOTONIC, &o->waitable_due_time);
+        LONGLONG ns = -dueTime->QuadPart * 100LL;
+        o->waitable_due_time.tv_sec  += (time_t)(ns / 1000000000LL);
+        o->waitable_due_time.tv_nsec += (long)(ns % 1000000000LL);
+        if (o->waitable_due_time.tv_nsec >= 1000000000L) {
+            o->waitable_due_time.tv_sec++;
+            o->waitable_due_time.tv_nsec -= 1000000000L;
+        }
+    } else {
+        /* FILETIME epoch is 1601-01-01; Unix is 1970-01-01. */
+        /* An absolute (wall-clock) due time, kept as the equivalent point on
+         * the monotonic clock all waits use. */
+        LONGLONG unix100ns = dueTime->QuadPart - 116444736000000000LL;
+        struct timespec rt, mt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        clock_gettime(CLOCK_MONOTONIC, &mt);
+        LONGLONG delta_ns = unix100ns * 100LL
+                          - ((LONGLONG)rt.tv_sec * 1000000000LL + rt.tv_nsec);
+        LONGLONG mono_ns = (LONGLONG)mt.tv_sec * 1000000000LL + mt.tv_nsec + delta_ns;
+        if (mono_ns < 0) mono_ns = 0;
+        o->waitable_due_time.tv_sec  = (time_t)(mono_ns / 1000000000LL);
+        o->waitable_due_time.tv_nsec = (long)(mono_ns % 1000000000LL);
+    }
+    (void)period;
+    o->waitable_armed = 1;
+    o->waitable_triggered = 0;
+    pthread_mutex_unlock(&o->lock);
+    pthread_cond_broadcast(&o->cond);
+    return TRUE;
+}
+
+BOOL CancelWaitableTimer(HANDLE h)
+{
+    w32_object *o = H2O(h);
+    if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    o->waitable_triggered = 0;
+    o->waitable_armed = 0;
+    pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
 
@@ -883,6 +1291,123 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+#if defined(__APPLE__)
+/* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
+ * for VirtualAlloc: MAP_FIXED silently unmaps whatever already occupies the
+ * range, and a bare address hint can be relocated by the kernel for reasons
+ * other than the range being taken -- so "we got a different address" is only
+ * an approximation of "it was occupied", and a racy one.
+ *
+ * mach_vm_map with VM_FLAGS_FIXED is the exact primitive: it maps at the
+ * address given, and returns KERN_NO_SPACE rather than displacing an existing
+ * mapping. That is what Win32 promises, and this layer exists to keep the Xbox
+ * HLE above it honest -- a VirtualAlloc that quietly replaced a live mapping
+ * would corrupt whatever held it, far from the call that did it.
+ *
+ * Memory from mach_vm_map is released by munmap like any other, because the
+ * BSD and Mach halves of Darwin share one VM map, so VirtualFree is unchanged.
+ */
+static void *mach_map_fixed(void *address, size_t size, int prot)
+{
+    mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
+    mach_vm_size_t len = (size + vm_page_size - 1) & ~((mach_vm_size_t)vm_page_size - 1);
+    vm_prot_t vmprot = VM_PROT_NONE;
+
+    if (prot & PROT_READ)  vmprot |= VM_PROT_READ;
+    if (prot & PROT_WRITE) vmprot |= VM_PROT_WRITE;
+    if (prot & PROT_EXEC)  vmprot |= VM_PROT_EXECUTE;
+
+    kern_return_t kr = mach_vm_map(
+        mach_task_self(),
+        &addr,
+        len,
+        0,
+        VM_FLAGS_FIXED,
+        MEMORY_OBJECT_NULL,
+        0,
+        FALSE,
+        vmprot,
+        VM_PROT_ALL,
+        VM_INHERIT_DEFAULT
+    );
+    if (kr != KERN_SUCCESS) {
+        return MAP_FAILED;
+    }
+    return (void *)(uintptr_t)addr;
+}
+#endif
+
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
+
+/* ---- the guest window (from Takedawn's xboxrecomp fork, MIT) -----------
+ * The memory layout maps the guest's views at fixed addresses spread over
+ * 4 GB from its base: RAM and its mirrors, the contiguous window, the device
+ * apertures near the top. With only part of that reserved, a mapping made
+ * meanwhile (on macOS the window's and MoltenVK's) can sit where a later view
+ * goes. xbox_compat_guest_window() records a whole-window PROT_NONE
+ * reservation; a fixed-address VirtualAlloc or MapViewOfFileEx whose pages
+ * are all still that placeholder replaces them (MAP_FIXED), anything else is
+ * refused as before; VirtualFree / UnmapViewOfFile in the window put the
+ * placeholder back. One bit per 4 KB page. */
+static uintptr_t s_gw_lo;
+static size_t    s_gw_pages;
+static uint8_t  *s_gw_bits;      /* 1: page is our placeholder */
+
+void xbox_compat_guest_window(void *lo, size_t size)
+{
+    size_t n = size / 4096u;
+    uint8_t *b = (uint8_t *)malloc((n + 7) / 8);
+    if (!b) return;
+    memset(b, 0xFF, (n + 7) / 8);
+    s_gw_bits = b;
+    s_gw_lo = (uintptr_t)lo;
+    s_gw_pages = n;
+}
+
+static int gw_range(const void *a, size_t n, size_t *p0, size_t *p1)
+{
+    uintptr_t x = (uintptr_t)a;
+    if (!s_gw_bits || x < s_gw_lo || n == 0) return 0;
+    *p0 = (x - s_gw_lo) / 4096u;
+    *p1 = (x - s_gw_lo + n + 4095u) / 4096u;
+    return *p1 <= s_gw_pages;
+}
+
+static int gw_placeholder(const void *a, size_t n)
+{
+    size_t p0, p1, i;
+    if (!gw_range(a, n, &p0, &p1)) return 0;
+    for (i = p0; i < p1; i++)
+        if (!(s_gw_bits[i >> 3] & (1u << (i & 7)))) return 0;
+    return 1;
+}
+
+static void gw_mark(const void *a, size_t n, int placeholder)
+{
+    size_t p0, p1, i;
+    if (!gw_range(a, n, &p0, &p1)) return;
+    for (i = p0; i < p1; i++) {
+        if (placeholder) s_gw_bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+        else             s_gw_bits[i >> 3] &= (uint8_t)~(1u << (i & 7));
+    }
+}
+
+/* Give [a, a+n) back to the window's placeholder; 1 if it was in the window. */
+static int gw_restore(void *a, size_t n)
+{
+    size_t p0, p1;
+    if (!gw_range(a, n, &p0, &p1)) return 0;
+    if (mmap(a, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
+        return -1;
+    gw_mark(a, n, 1);
+    return 1;
+}
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -896,19 +1421,66 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         /* fall through to a fresh mapping */
     }
 
+#if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
-    void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
-                   flags, -1, 0);
-    if (p == MAP_FAILED) { SetLastError(8); return NULL; }
+#endif
+
+    void *p;
+    if (!address && allocationType == MEM_RESERVE && protect == PAGE_NOACCESS) {
+        /* a pure reservation holds address space, not memory */
+        p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+        view_register(p, size);
+        return p;
+    }
+    if (address && gw_placeholder(address, size)) {
+        /* inside the guest window: replace our own placeholder */
+        p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (p != MAP_FAILED) { gw_mark(address, size, 0); view_register(p, size); return p; }
+    } else
+#if defined(__APPLE__)
+    if (address) {
+        p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
+    } else
+#endif
+    p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
+     * Win32 caller, and munmap cannot be called without one. */
+    view_register(p, size);
+#if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
+    /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
+     * unmap whatever already lives there, so we pass the address as a hint and
+     * treat a different result as "taken". Apple goes through mach_map_fixed
+     * above, which reports that properly instead of inferring it. */
+    if (address && p != address) {
+        munmap(p, size);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+#endif
     return p;
 }
 
 BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 {
     if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0; we can't know the length, so this
-         * path is only safe when callers pass the real size. */
-        if (size == 0) return TRUE;
+        /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
+         * the length comes from the registry VirtualAlloc filled in. Returning
+         * TRUE without unmapping -- as this used to -- made every release a
+         * silent no-op: the caller believed the address was free, the next
+         * allocation there failed, and nothing connected the two. */
+        size_t len = view_take(address);
+        if (size == 0) size = len;
+        if (size == 0) return FALSE;
+        {
+            int r = gw_restore(address, size);   /* back to the placeholder, not a hole */
+            if (r) return r > 0;
+        }
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
@@ -1000,9 +1572,66 @@ VOID OutputDebugStringA(LPCSTR str)
     if (str) fputs(str, stderr);
 }
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/threading.h>
+#include <emscripten/em_asm.h>
+/* A title "exits" to reboot (first boot formats the cache partition, then
+ * relaunches itself) or to the dashboard. There is no process to end: tell the
+ * page, which restarts or reports it, and park this thread. */
+static void web_exit(UINT exitCode)
+{
+    fflush(NULL);
+    MAIN_THREAD_ASYNC_EM_ASM({ if (Module.onGuestExit) Module.onGuestExit($0); }, (int)exitCode);
+    for (;;)
+        sleep(1000);
+}
+VOID ExitProcess(UINT exitCode) { web_exit(exitCode); }
+#else
 VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
+#endif
 
-VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt) { explicit_bzero(ptr, cnt); }
+BOOL IsDebuggerPresent(void)
+{
+#if defined(__APPLE__)
+    /* Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
+    struct kinfo_proc info;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    size_t size = sizeof(info);
+    memset(&info, 0, size);
+    if (sysctl(mib, sizeof(mib), &info, &size, NULL, 0) != 0) return FALSE;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+#else
+    /* Linux: a non-zero TracerPid in /proc/self/status means ptrace is attached. */
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return FALSE;
+    char line[256];
+    BOOL traced = FALSE;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "TracerPid:", 10) == 0) {
+            traced = strtol(line + 10, NULL, 10) != 0;
+            break;
+        }
+    }
+    fclose(f);
+    return traced;
+#endif
+}
+
+VOID DebugBreak(void) {
+    /* Not __debugbreak(): that is an MSVC intrinsic, and this file is the
+     * half that MSVC never compiles. SIGTRAP is the POSIX equivalent --
+     * continuable under a debugger, fatal without one, as on Windows. */
+    raise(SIGTRAP);
+}
+
+VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
+{
+#if defined(__APPLE__)
+    memset_s(ptr, cnt, 0, cnt);
+#else
+    explicit_bzero(ptr, cnt);
+#endif
+}
 
 unsigned int _clearfp(void)
 {
@@ -1093,6 +1722,16 @@ DWORD GetFileSize(HANDLE h, LPDWORD high)
     return (DWORD)(st.st_size & 0xFFFFFFFFu);
 }
 
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
+{
+    int fd = w32_handle_fd(h);
+    if (fd < 0 || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
+}
+
 BOOL FlushFileBuffers(HANDLE h)
 {
     int fd = w32_handle_fd(h);
@@ -1105,10 +1744,12 @@ BOOL FlushFileBuffers(HANDLE h)
 /* via SDL_GetKeyboardState when main.c gets its SDL2 port.              */
 /* ===================================================================== */
 
-SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
+__attribute__((weak)) SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
 HWND  FindWindowA(LPCSTR c, LPCSTR w)     { (void)c; (void)w; return NULL; }
 HWND  GetActiveWindow(void)               { return NULL; }
 BOOL  SetWindowTextA(HWND h, LPCSTR t)    { (void)h; (void)t; return TRUE; }
+int   GetWindowTextA(HWND h, LPSTR t, int n) { (void)h; (void)t; (void)n; return 0; }
+BOOL  EnumWindows(WNDENUMPROC p, LPARAM l) { (void)p; (void)l; return FALSE; }
 
 int MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type)
 {
@@ -1126,13 +1767,17 @@ BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
 LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
 /* XInput stub: real gamepad is wired through input_compat (SDL2). */
-DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
+__attribute__((weak)) DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
 { (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
 
 BOOL TerminateProcess(HANDLE process, UINT exitCode)
 {
     (void)process;
+#if defined(__EMSCRIPTEN__)
+    web_exit(exitCode);
+#else
     exit((int)exitCode);
+#endif
 }
 
 VOID OutputDebugStringW(LPCWSTR str)
@@ -1225,7 +1870,7 @@ typedef struct { void *addr; size_t len; } w32_view;
 static w32_view        s_views[512];
 static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void view_register(void *addr, size_t len)
+void view_register(void *addr, size_t len)
 {
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
@@ -1233,7 +1878,31 @@ static void view_register(void *addr, size_t len)
     pthread_mutex_unlock(&s_views_lock);
 }
 
-static size_t view_take(const void *addr)
+/* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
+ * is asked about addresses *within* a region at least as often as about its
+ * base -- a translated guest VA lands in the middle of the 64 MB window.
+ * Picks the containing region and reports where it starts. */
+int view_lookup(const void *addr, void **base_out, size_t *len_out)
+{
+    int found = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        if (!s_views[i].addr)
+            continue;
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        uintptr_t hi = lo + s_views[i].len;
+        if ((uintptr_t)addr >= lo && (uintptr_t)addr < hi) {
+            if (base_out) *base_out = s_views[i].addr;
+            if (len_out)  *len_out  = s_views[i].len;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return found;
+}
+
+size_t view_take(const void *addr)
 {
     size_t len = 0;
     pthread_mutex_lock(&s_views_lock);
@@ -1243,6 +1912,24 @@ static size_t view_take(const void *addr)
     return len;
 }
 
+/* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
+ * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
+static int anon_map_fd(const char *name)
+{
+#if defined(__APPLE__)
+    static volatile LONG map_counter = 0;
+    char shm_name[32];
+    LONG seq = InterlockedIncrement(&map_counter);
+    const char *base = name ? name : "xbox_map";
+    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (fd >= 0) shm_unlink(shm_name);
+    return fd;
+#else
+    return memfd_create(name ? name : "xbox_map", 0);
+#endif
+}
+
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
 {
@@ -1250,7 +1937,7 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
-    int fd = memfd_create(name ? name : "xbox_map", 0);
+    int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (ftruncate(fd, (off_t)size) != 0) {
         close(fd);
@@ -1261,7 +1948,7 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     w32_object *o = obj_alloc(K_FILEMAP);
     o->fd       = fd;
     o->map_size = size;
-    return (HANDLE)o;
+    return O2H(o);
 }
 
 HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
@@ -1274,16 +1961,49 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
-    w32_object *o = (w32_object *)mapping;
+    w32_object *o = H2O(mapping);
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
+    int flags  = MAP_SHARED;
+
+    /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
+     * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
+     * and succeeds. The Xbox memory model asks for 28 mirror views at computed
+     * addresses, so with a base the OS chose rather than one we picked, that
+     * difference is the process quietly destroying its own libraries and heap
+     * and dying somewhere unrelated a moment later. */
+    if (baseAddr && gw_placeholder(baseAddr, len)) {
+        flags |= MAP_FIXED;              /* replaces our placeholder only */
+        gw_mark(baseAddr, len, 0);
+    } else if (baseAddr) {
+#if defined(MAP_FIXED_NOREPLACE)
+        flags |= MAP_FIXED_NOREPLACE;
+#elif defined(__APPLE__)
+        /* Darwin has no MAP_FIXED_NOREPLACE. Claim the range first with
+         * mach_vm_map(VM_FLAGS_FIXED), which refuses rather than displaces;
+         * MAP_FIXED below can then only replace the placeholder we now own. */
+        if (mach_map_fixed(baseAddr, len, PROT_READ | PROT_WRITE) == MAP_FAILED) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        flags |= MAP_FIXED;
+#else
+        flags |= MAP_FIXED;
+#endif
+    }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (baseAddr && p != baseAddr) {
+        /* MAP_FIXED_NOREPLACE hands back a different address instead of
+         * failing on some kernels; treat that as the refusal it means. */
+        munmap(p, len);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
     view_register(p, len);
     return p;
 }
@@ -1297,6 +2017,10 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
     size_t len = view_take(baseAddr);
     if (len == 0) return FALSE;
+    {
+        int r = gw_restore((void *)baseAddr, len);
+        if (r) return r > 0;
+    }
     return munmap((void *)baseAddr, len) == 0;
 }
 
@@ -1304,23 +2028,132 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 /* VirtualQuery                                                           */
 /* ===================================================================== */
 
+/*
+ * Answers from the view registry rather than from a constant.
+ *
+ * This used to report RegionSize 0x1000, MEM_COMMIT, PAGE_READWRITE and
+ * AllocationBase NULL for every address it was handed, mapped or not. Four
+ * kernel entry points are built on it, and one of them chooses a deallocator
+ * with it: MmFreeContiguousMemory frees via VirtualFree only when
+ * AllocationBase equals the pointer, so a hardcoded NULL sent every
+ * contiguous buffer -- all of which come from VirtualAlloc, i.e. mmap -- to
+ * _aligned_free, which is free(). The allocator aborts on the foreign
+ * pointer. MmQueryAllocationSize answered 0x1000 for everything and
+ * NtQueryVirtualMemory called unmapped addresses committed and readable.
+ *
+ * Everything the shim maps -- VirtualAlloc and MapViewOfFileEx alike -- is in
+ * the registry, so it can answer for exactly the memory it owns and say
+ * MEM_FREE for the rest. Saying MEM_FREE for an address it did not map is the
+ * honest answer: a host heap pointer is not a Win32 reservation, and the
+ * callers that branch on this want to know which allocator owns the pointer.
+ */
 SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length)
 {
     if (!buffer || length < sizeof(*buffer)) return 0;
     memset(buffer, 0, sizeof(*buffer));
-    buffer->BaseAddress    = (PVOID)address;
-    buffer->AllocationBase = NULL;       /* != address -> freed via _aligned_free */
-    buffer->RegionSize     = 0x1000;
-    buffer->State          = MEM_COMMIT;
-    buffer->Protect        = PAGE_READWRITE;
-    buffer->Type           = 0x20000;    /* MEM_PRIVATE */
+
+    void  *base = NULL;
+    size_t len  = 0;
+
+    if (!view_lookup(address, &base, &len)) {
+#if defined(__APPLE__)
+        /* OpenTricky (macOS): the kernel's own answer. A free address gets the
+         * size of the hole up to the next mapping, as on Windows -- the
+         * memory layout sizes its search for a base on it. */
+        {
+            mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)address & ~(mach_vm_address_t)(vm_page_size - 1);
+            mach_vm_address_t r = a;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t info;
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj = MACH_PORT_NULL;
+            kern_return_t kr = mach_vm_region(mach_task_self(), &r, &rs, VM_REGION_BASIC_INFO_64,
+                                              (vm_region_info_t)&info, &cnt, &obj);
+            buffer->BaseAddress = (PVOID)(uintptr_t)a;
+            if (kr == KERN_SUCCESS && r <= a) {          /* inside a mapping */
+                buffer->AllocationBase = (PVOID)(uintptr_t)r;
+                buffer->RegionSize = (SIZE_T)(r + rs - a);
+                buffer->State = MEM_COMMIT;
+                buffer->Protect = PAGE_READWRITE;
+                buffer->Type = MEM_PRIVATE;
+            } else {                                     /* a hole: up to the next one */
+                buffer->AllocationBase = NULL;
+                buffer->RegionSize = (SIZE_T)(kr == KERN_SUCCESS ? r - a
+                                                                  : (mach_vm_address_t)0x7FFFFFFFF000ull - a);
+                buffer->State = MEM_FREE;
+                buffer->Protect = PAGE_NOACCESS;
+                buffer->Type = 0;
+            }
+            return sizeof(*buffer);
+        }
+#endif
+        /* Not ours. Report it free rather than inventing a committed page. */
+        buffer->BaseAddress    = (PVOID)address;
+        buffer->AllocationBase = NULL;
+        buffer->RegionSize     = 0;
+        buffer->State          = MEM_FREE;
+        buffer->Protect        = PAGE_NOACCESS;
+        buffer->Type           = 0;
+        return sizeof(*buffer);
+    }
+
+    buffer->BaseAddress      = (PVOID)address;
+    buffer->AllocationBase   = base;
+    buffer->AllocationProtect = PAGE_READWRITE;
+    /* From the queried address to the end of the region, which is what Win32
+     * reports and what callers sizing a copy out of it depend on. */
+    buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
+    buffer->State            = MEM_COMMIT;
+    buffer->Protect          = PAGE_READWRITE;
+    buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
-    struct sysinfo si;
     if (!b) return FALSE;
+#if defined(__APPLE__)
+    /* Darwin has no sysinfo(2): physical memory comes from sysctl hw.memsize,
+     * swap from vm.swapusage, the free page count from the Mach VM statistics. */
+    uint64_t memsize = 0;
+    size_t   len     = sizeof(memsize);
+    int oid_memsize[] = { CTL_HW, HW_MEMSIZE };
+    if (sysctl(oid_memsize, 2, &memsize, &len, NULL, 0) != 0) return FALSE;
+
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) page = 4096;
+
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    ULONGLONG avail = 0;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &count) == KERN_SUCCESS)
+        avail = ((ULONGLONG)vm.free_count + vm.inactive_count) * (ULONGLONG)page;
+
+    struct xsw_usage swap;
+    len = sizeof(swap);
+    int oid_swapusage[] = { CTL_VM, VM_SWAPUSAGE };
+    if (sysctl(oid_swapusage, 2, &swap, &len, NULL, 0) != 0)
+        memset(&swap, 0, sizeof(swap));
+
+    b->ullTotalPhys     = (ULONGLONG)memsize;
+    b->ullAvailPhys     = avail;
+    b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)swap.xsu_total;
+    b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)swap.xsu_avail;
+#elif defined(__EMSCRIPTEN__)
+    /* The wasm heap is the machine: what it may grow to, and what is left. */
+    {
+        extern size_t emscripten_get_heap_max(void);
+        extern size_t emscripten_get_heap_size(void);
+        ULONGLONG max = (ULONGLONG)emscripten_get_heap_max();
+        ULONGLONG used = (ULONGLONG)emscripten_get_heap_size();
+        b->ullTotalPhys     = max;
+        b->ullAvailPhys     = max > used ? max - used : 0;
+        b->ullTotalPageFile = b->ullTotalPhys;
+        b->ullAvailPageFile = b->ullAvailPhys;
+    }
+#else
+    struct sysinfo si;
     if (sysinfo(&si) != 0) return FALSE;
 
     ULONGLONG unit = si.mem_unit ? si.mem_unit : 1;
@@ -1328,6 +2161,7 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
     b->ullAvailPhys     = (ULONGLONG)si.freeram   * unit;
     b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)si.totalswap * unit;
     b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)si.freeswap  * unit;
+#endif
     b->ullTotalVirtual  = b->ullTotalPhys;
     b->ullAvailVirtual  = b->ullAvailPhys;
     b->ullAvailExtendedVirtual = 0;

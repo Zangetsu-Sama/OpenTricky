@@ -51,7 +51,9 @@
 #include <wchar.h>
 #include <stdint.h>
 #ifdef __GNUC__
+#if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
+#endif
 #endif
 
 #ifndef SSX_BUILD_ID

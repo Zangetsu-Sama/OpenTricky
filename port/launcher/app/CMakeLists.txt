@@ -9,7 +9,14 @@
 # Dependencies are built from the sources in port/third_party (no system
 # package is used): SDL3, FreeType (no zlib/png/harfbuzz/brotli), RmlUi, miniz.
 cmake_minimum_required(VERSION 3.20)
-project(OpenTricky C CXX RC)
+project(OpenTricky C CXX)
+# Windows: the icon and version resource (OpenTricky.rc). macOS: SDL3's
+# Cocoa sources are Objective-C; no resource (the app bundle has the icon).
+if(WIN32)
+    enable_language(RC)
+elseif(APPLE)
+    enable_language(OBJC)
+endif()
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
@@ -27,6 +34,12 @@ set(OT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 set(CMAKE_DISABLE_FIND_PACKAGE_Freetype TRUE)
 set(CMAKE_DISABLE_FIND_PACKAGE_SDL3 TRUE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# macOS cross build (Docker, clang 18 with the SDK's newer libc++ headers):
+# the bit builtins those headers need (ot_macos_cxx_compat.h), in every C++
+# source, RmlUi's included.
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/ot_macos_cxx_compat.h>")
+endif()
 
 # ── SDL3 (static) ──
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -91,10 +104,12 @@ add_executable(OpenTricky WIN32
     ot_update.cpp
     ot_install.cpp
     ${OT_SRC}/settings.c
-    OpenTricky.rc
     ${RMLUI_BACKENDS}/RmlUi_Platform_SDL.cpp
     ${RMLUI_BACKENDS}/RmlUi_Renderer_GL3.cpp
 )
+if(WIN32)
+    target_sources(OpenTricky PRIVATE OpenTricky.rc)
+endif()
 target_include_directories(OpenTricky PRIVATE ${RMLUI_BACKENDS} ${CMAKE_CURRENT_SOURCE_DIR} ${OT_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 # The icon (OpenTricky.ico, made by make_icon.py) and the version resource
@@ -120,7 +135,17 @@ foreach(f ${OT_PAGE_FILES})
 endforeach()
 # The extras' settings (port/extras.cmake): off by default; not in the public tree.
 include(${OT_SRC}/../extras.cmake OPTIONAL)
-target_link_libraries(OpenTricky PRIVATE ot_launcher_assets ${OT_MINIZ_LIB} ot_sign RmlUi::Core SDL3::SDL3-static shell32 ole32 uuid psapi winhttp)
+target_link_libraries(OpenTricky PRIVATE ot_launcher_assets ${OT_MINIZ_LIB} ot_sign RmlUi::Core SDL3::SDL3-static)
+if(WIN32)
+    target_link_libraries(OpenTricky PRIVATE shell32 ole32 uuid psapi winhttp)
+elseif(APPLE)
+    # macOS: no self-updater (OT_NO_UPDATES, main.cpp): the app is replaced
+    # as a whole. OpenGL is loaded at run time by RmlUi's GL3 loader, linked
+    # anyway so the framework is there; SDL3-static brings its own frameworks.
+    target_compile_definitions(OpenTricky PRIVATE OT_NO_UPDATES=1)
+    target_sources(OpenTricky PRIVATE ot_macos_glue.c)
+    target_link_libraries(OpenTricky PRIVATE "-framework OpenGL")
+endif()
 if(MINGW)
     target_link_options(OpenTricky PRIVATE -static -static-libgcc -static-libstdc++ -s)
 endif()
@@ -162,6 +187,15 @@ file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/ot_whatsnew.inc
 # the repository's own copy. A notice that is only a passage of a third-party
 # file, or the toolchain's own file of the GCC exception, is read from its copy
 # in port/third_party/notices (port/third_party/VERSIONS.txt).
+# The toolchain's runtimes linked into the Windows build (MinGW-w64); the
+# macOS build uses the system's own libc++ and libSystem (nothing linked in).
+set(OT_TOOLCHAIN_LICENCES "")
+if(WIN32)
+    set(OT_TOOLCHAIN_LICENCES
+        "MinGW-w64 runtime (ZPL 2.1 and others), in the launcher and the game|${OT_THIRD_PARTY}/mingw-w64/crt/COPYING.MinGW-w64-runtime.txt"
+        "winpthreads (MIT and BSD 3-clause)|${OT_THIRD_PARTY}/mingw-w64/winpthreads/COPYING"
+        "GCC runtime: libgcc, libstdc++ and GCC's headers (GNU GPL 3.0 or later, with this exception)|${OT_THIRD_PARTY}/notices/gcc-runtime-exception.txt")
+endif()
 set(OT_LICENCES "")
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/licenses-head.txt OT_PART)
 string(APPEND OT_LICENCES "${OT_PART}")
@@ -183,9 +217,7 @@ foreach(part
         "zlib (zlib licence), in FreeType's gzip module|${OT_THIRD_PARTY}/notices/freetype-zlib.txt"
         "miniz (MIT)|${OT_THIRD_PARTY}/miniz/LICENSE"
         "Monocypher (BSD 2-clause, or CC0)|${OT_THIRD_PARTY}/monocypher/LICENCE.md"
-        "MinGW-w64 runtime (ZPL 2.1 and others), in the launcher and the game|${OT_THIRD_PARTY}/mingw-w64/crt/COPYING.MinGW-w64-runtime.txt"
-        "winpthreads (MIT and BSD 3-clause)|${OT_THIRD_PARTY}/mingw-w64/winpthreads/COPYING"
-        "GCC runtime: libgcc, libstdc++ and GCC's headers (GNU GPL 3.0 or later, with this exception)|${OT_THIRD_PARTY}/notices/gcc-runtime-exception.txt"
+        ${OT_TOOLCHAIN_LICENCES}
         "Inter (SIL Open Font License 1.1)|${CMAKE_CURRENT_SOURCE_DIR}/ui/fonts/OFL-Inter.txt"
         "Exo 2 (SIL Open Font License 1.1)|${CMAKE_CURRENT_SOURCE_DIR}/ui/fonts/OFL-Exo2.txt"
         "xboxrecomp (MIT), in the game|${CMAKE_CURRENT_SOURCE_DIR}/../../../xboxrecomp/LICENSE"
